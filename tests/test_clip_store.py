@@ -80,3 +80,26 @@ def test_list_recent_orders_by_update(tmp_path):
     rows = store.list_recent_ingestions("Clip", limit=10)
     assert [r["session_id"] for r in rows][0] == "S2"
     assert len(rows) == 3
+
+
+def test_missing_supabase_clip_tables_fall_back_to_sqlite(monkeypatch, tmp_path):
+    monkeypatch.setattr(settings, "SUPABASE_URL", "https://example.supabase.co")
+    monkeypatch.setattr(settings, "SUPABASE_KEY", "configured")
+    monkeypatch.setattr(settings, "DATABASE_URL", f"sqlite:///{tmp_path}/fallback.db")
+
+    def missing_tables():
+        raise RuntimeError("PGRST205: clip_device_state is missing")
+
+    monkeypatch.setattr(store, "_supabase_init", missing_tables)
+    store.init_clip_ingestions()
+
+    # Supabase remains configured, but every subsequent Clip operation must
+    # consistently use the initialized SQLite fallback.
+    assert store._use_supabase() is False
+    assert store.is_baseline_complete("Clip") is False
+    store.mark_baseline_complete("Clip")
+    store.upsert_ingestion("Clip", "S1", status="stopped")
+    store.mark_status("Clip", "S1", "processing")
+    assert store.is_baseline_complete("Clip") is True
+    assert store.get_ingestion("Clip", "S1")["status"] == "processing"
+    assert store.list_recent_ingestions("Clip", 10)[0]["session_id"] == "S1"

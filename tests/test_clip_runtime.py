@@ -176,6 +176,29 @@ def make_runtime(transport: FakeTransport | None = None, device_id: str = "Clip"
 # ---------------------------------------------------------------------------
 
 class TestSupervisor:
+    def test_ble_settings_are_trimmed(self, monkeypatch):
+        transport = FakeTransport()
+        captured = {}
+
+        def make_transport(*, address, name):
+            captured.update(address=address, name=name)
+            return transport
+
+        monkeypatch.setattr(settings, "CLIP_BLE_ADDRESS", "  C4:F1:79:A4:09:A0  ")
+        monkeypatch.setattr(settings, "CLIP_BLE_NAME", "  reSpeaker Clip  ")
+        monkeypatch.setattr("backend.clip.runtime.BleTransport", make_transport)
+
+        runtime = ClipRuntime()
+
+        assert captured == {
+            "address": "C4:F1:79:A4:09:A0",
+            "name": "reSpeaker Clip",
+        }
+        assert runtime.device_id == "C4:F1:79:A4:09:A0"
+
+        named_runtime = ClipRuntime(transport=FakeTransport(), device_id="  local Clip  ")
+        assert named_runtime.device_id == "local Clip"
+
     def test_reconnect_delay_sequence(self):
         assert [reconnect_delay_seconds(i) for i in range(6)] == [1, 2, 4, 8, 16, 30]
         assert reconnect_delay_seconds(99) == 30.0

@@ -11,12 +11,17 @@ from __future__ import annotations
 import logging
 import sqlite3
 from datetime import datetime, timezone
-from typing import Any, Iterable
+from typing import Any, Iterable, Literal
 
 from config import settings
 from backend.database import supabase_client
 
 logger = logging.getLogger(__name__)
+
+# Selected once by ``init_clip_ingestions`` so every Clip operation in a
+# process uses the same backend.  In particular, having general Supabase
+# credentials does not imply that the optional Clip tables were installed.
+_backend: Literal["supabase", "sqlite"] | None = None
 
 # Suggested lifecycle: recording -> stopped -> downloading -> processing ->
 # completed | failed.  ignored_existing marks the first-start integration
@@ -48,6 +53,8 @@ TABLE_COLUMNS = (
 
 
 def _use_supabase() -> bool:
+    if _backend is not None:
+        return _backend == "supabase"
     return bool(settings.SUPABASE_URL and settings.SUPABASE_KEY)
 
 
@@ -205,17 +212,12 @@ def _sqlite_mark_baseline_complete(device_id: str) -> None:
 # ---------------------------------------------------------------------------
 
 def _supabase_init() -> None:
-    try:
-        supabase_client.get_client().from_("clip_ingestions").select(
-            "device_id, session_id"
-        ).limit(1).execute()
-        supabase_client.get_client().from_("clip_device_state").select(
-            "device_id, baseline_completed"
-        ).limit(1).execute()
-    except Exception as exc:  # table missing
-        logger.warning(
-            "Supabase clip_ingestions unavailable (run supabase_schema.sql): %s", exc
-        )
+    supabase_client.get_client().from_("clip_ingestions").select(
+        "device_id, session_id"
+    ).limit(1).execute()
+    supabase_client.get_client().from_("clip_device_state").select(
+        "device_id, baseline_completed"
+    ).limit(1).execute()
 
 
 def _supabase_upsert(device_id: str, session_id: str, fields: dict[str, Any]) -> None:
@@ -304,10 +306,24 @@ def _supabase_list_recent(device_id: str | None, limit: int) -> list[dict[str, A
 # ---------------------------------------------------------------------------
 
 def init_clip_ingestions() -> None:
-    if _use_supabase():
-        _supabase_init()
+    global _backend
+
+    if settings.SUPABASE_URL and settings.SUPABASE_KEY:
+        try:
+            _supabase_init()
+        except Exception as exc:
+            _sqlite_init()
+            _backend = "sqlite"
+            logger.warning(
+                "Supabase Clip tables unavailable; using SQLite for all Clip "
+                "state (run supabase_schema.sql to enable Supabase): %s",
+                exc,
+            )
+        else:
+            _backend = "supabase"
     else:
         _sqlite_init()
+        _backend = "sqlite"
 
 
 def upsert_ingestion(

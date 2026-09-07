@@ -98,13 +98,16 @@ class ClipRuntime:
         transport: Any | None = None,
         device_id: str | None = None,
     ) -> None:
+        ble_address = settings.CLIP_BLE_ADDRESS.strip()
+        ble_name = settings.CLIP_BLE_NAME.strip() or "Clip"
+        explicit_device_id = (device_id or "").strip()
         self._transport = transport or BleTransport(
-            address=settings.CLIP_BLE_ADDRESS or None,
-            name=settings.CLIP_BLE_NAME,
+            address=ble_address or None,
+            name=ble_name,
         )
         self._client = ClipClient(self._transport)
         self._client.on_event(self._on_event_callback)
-        self.device_id = device_id or (settings.CLIP_BLE_ADDRESS or settings.CLIP_BLE_NAME or "Clip")
+        self.device_id = explicit_device_id or ble_address or ble_name
 
         self._temp_dir = Path(settings.CLIP_TEMP_DIR)
 
