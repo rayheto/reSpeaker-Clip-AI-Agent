@@ -457,7 +457,9 @@ npx respeaker-clip status --base-url http://localhost:5000
   runtime and its API only: the agent stack is never imported, no
   `GROQ_API_KEY` is needed, and each finalized utterance / downloaded session is
   re-containerized to Ogg and served over HTTP (`utterance_audio` and
-  `session_audio` events) instead of being transcribed and answered.
+  `session_audio` events) instead of being transcribed and answered. Deploying
+  that mode: [`DEPLOYMENT-GATEWAY.md`](packages/respeaker-clip/DEPLOYMENT-GATEWAY.md)
+  (中文：[`DEPLOYMENT-GATEWAY.zh-cn.md`](packages/respeaker-clip/DEPLOYMENT-GATEWAY.zh-cn.md)).
 - **Deployment guide** — systemd unit, BLE/D-Bus permissions, nginx for the SSE
   stream, security notes (the API has no auth and CORS is open), upgrades and a
   troubleshooting table: [`packages/respeaker-clip/DEPLOYMENT.md`](packages/respeaker-clip/DEPLOYMENT.md)

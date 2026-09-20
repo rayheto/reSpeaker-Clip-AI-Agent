@@ -52,7 +52,9 @@
     "dist",
     "README.md",
     "DEPLOYMENT.md",
-    "DEPLOYMENT.zh-cn.md"
+    "DEPLOYMENT.zh-cn.md",
+    "DEPLOYMENT-GATEWAY.md",
+    "DEPLOYMENT-GATEWAY.zh-cn.md"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",

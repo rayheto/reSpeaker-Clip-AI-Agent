@@ -308,6 +308,10 @@ sudo systemctl start respeaker-clip                 # re-runs pip install for --
 
 ## 11. Device gateway: `--no-agent`
 
+> Standalone guide for this mode: **[DEPLOYMENT-GATEWAY.md](./DEPLOYMENT-GATEWAY.md)**
+> (中文：[DEPLOYMENT-GATEWAY.zh-cn.md](./DEPLOYMENT-GATEWAY.zh-cn.md)).
+> The section below is the short version.
+
 Use this when you want the Clip as a voice input and **your own** ASR/agent
 downstream — the service then only runs the device and hands you audio:
 

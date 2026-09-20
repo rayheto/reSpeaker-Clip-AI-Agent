@@ -375,7 +375,9 @@ npx respeaker-clip status --base-url http://localhost:5000
 - **设备网关模式** — `respeaker-clip serve --no-agent` 只运行 Clip 运行时及其 API：
   不导入 agent 技术栈、不需要 `GROQ_API_KEY`，每段 utterance 与每个下载的会话都被
   重新封装为 Ogg 并通过 HTTP 提供（`utterance_audio`、`session_audio` 事件），
-  而不是被转写和回答。
+  而不是被转写和回答。该模式的部署文档：
+  [`DEPLOYMENT-GATEWAY.zh-cn.md`](packages/respeaker-clip/DEPLOYMENT-GATEWAY.zh-cn.md)
+  （English：[`DEPLOYMENT-GATEWAY.md`](packages/respeaker-clip/DEPLOYMENT-GATEWAY.md)）。
 - **部署文档** — systemd unit、BLE/D-Bus 权限、SSE 的 nginx 配置、安全说明
   （API 无鉴权且 CORS 全开）、升级与故障排查表：
   [`packages/respeaker-clip/DEPLOYMENT.zh-cn.md`](packages/respeaker-clip/DEPLOYMENT.zh-cn.md)

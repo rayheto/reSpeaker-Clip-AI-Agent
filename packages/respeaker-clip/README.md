@@ -139,6 +139,10 @@ your own schedule or point it at a volume you manage.
 `--no-agent` refuses to combine with `--no-clip` (nothing would be served) and
 with `--input-mode browser` (browser voice needs the agent).
 
+Deploying this mode (systemd, retention, proxy, troubleshooting):
+**[DEPLOYMENT-GATEWAY.md](./DEPLOYMENT-GATEWAY.md)** —
+中文版 **[DEPLOYMENT-GATEWAY.zh-cn.md](./DEPLOYMENT-GATEWAY.zh-cn.md)**.
+
 ### REST methods
 
 | Method | Endpoint |

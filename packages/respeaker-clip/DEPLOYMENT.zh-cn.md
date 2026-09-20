@@ -270,6 +270,10 @@ sudo systemctl start respeaker-clip                 # --source 模式下会重�
 
 ## 11. 设备网关模式：`--no-agent`
 
+> 该模式的独立文档：**[DEPLOYMENT-GATEWAY.zh-cn.md](./DEPLOYMENT-GATEWAY.zh-cn.md)**
+> （English：[DEPLOYMENT-GATEWAY.md](./DEPLOYMENT-GATEWAY.md)）。
+> 本节是精简版。
+
 如果你只想把 Clip 当作语音输入，转写和后续处理由**你自己的** ASR/agent 负责，就用这个模式：
 
 ```bash
