@@ -51,9 +51,13 @@ from backend.clip.exceptions import (
     ClipTransferFailedError,
     ClipUnavailableError,
 )
-from backend.clip.ogg import OpusFormatError, convert_session_to_ogg
+from backend.clip.audio_paths import session_audio_url, utterance_audio_path, utterance_audio_url
+from backend.clip.ogg import (
+    OpusFormatError,
+    convert_frames_to_ogg_bytes,
+    convert_session_to_ogg,
+)
 from backend.clip.transfer import download_session_compatible
-from backend.services.audio_service import AudioService
 
 logger = logging.getLogger(__name__)
 
@@ -171,6 +175,8 @@ class ClipRuntime:
         transport: Any | None = None,
         device_id: str | None = None,
         rtc_auto_arm: bool | None = None,
+        agent_enabled: bool | None = None,
+        audio_service: Any | None = None,
     ) -> None:
         ble_address = settings.CLIP_BLE_ADDRESS.strip()
         ble_name = settings.CLIP_BLE_NAME.strip() or "Clip"
@@ -266,11 +272,29 @@ class ClipRuntime:
         self._rtc_finalize_pending = 0
 
         # Injected collaborators (overridden in tests)
-        self.audio_service = AudioService()
+        self.agent_enabled = (
+            settings.AGENT_ENABLED if agent_enabled is None else bool(agent_enabled)
+        )
+        self.audio_service = (
+            audio_service if audio_service is not None else self._build_audio_service()
+        )
         self.ogg_converter = convert_session_to_ogg
         self.session_downloader = download_session_compatible
         self.rtc_stt_partial = _rtc_partial_stt_default
         self.rtc_stt_final = _rtc_final_stt_default
+
+    def _build_audio_service(self) -> Any | None:
+        """Build the agent pipeline, but only when the agent is enabled.
+
+        Imported here rather than at module scope so that a device-gateway
+        deployment (``AGENT_ENABLED=false``) never loads LangGraph, Groq, Mem0,
+        Pinecone or the conversation store: the Clip runtime stands alone.
+        """
+        if not self.agent_enabled:
+            return None
+        from backend.services.audio_service import AudioService
+
+        return AudioService()
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -1096,7 +1120,46 @@ class ClipRuntime:
             finally:
                 self._rtc_finalize_pending = max(0, self._rtc_finalize_pending - 1)
 
+    async def _exchange_utterance(self, job: dict[str, Any]) -> None:
+        """Device-gateway path for one utterance: keep the audio, skip the AI.
+
+        No transcription and no agent: the frames are re-containerized to Ogg,
+        written under ``CLIP_TEMP_DIR/rtc/<session>/`` and announced with an
+        ``utterance_audio`` event carrying a URL the client can fetch. ASR and
+        the reply are the consumer's business.
+        """
+        uid = job["utterance_id"]
+        frames = job["frames"]
+        session = job.get("session") or "unknown"
+        payload: dict[str, Any] = {
+            "type": "utterance_audio",
+            "utterance_id": uid,
+            "session": session,
+        }
+        if len(frames) < settings.RTC_MIN_UTTERANCE_FRAMES:
+            payload["skipped"] = "too short"
+            self._push_event(payload)
+            return
+        try:
+            audio = await asyncio.to_thread(convert_frames_to_ogg_bytes, frames)
+            path = utterance_audio_path(session, uid)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            await asyncio.to_thread(path.write_bytes, audio)
+        except Exception as exc:
+            logger.exception("clip utterance audio exchange failed for %s: %s", uid, exc)
+            payload["error"] = str(exc)
+            self._push_event(payload)
+            return
+        payload["url"] = utterance_audio_url(session, uid)
+        payload["bytes"] = len(audio)
+        payload["content_type"] = "audio/ogg"
+        payload["trigger"] = job.get("reason")
+        self._push_event(payload)
+
     async def _rtc_finalize_job(self, job: dict[str, Any]) -> None:
+        if not self.agent_enabled:
+            await self._exchange_utterance(job)
+            return
         uid = job["utterance_id"]
         frames = job["frames"]
         session = job.get("session")
@@ -1697,6 +1760,7 @@ class ClipRuntime:
                 "last_error": self._last_error,
                 "input_mode": settings.VOICE_INPUT_MODE,
                 "record_mode": settings.CLIP_RECORD_MODE,
+                "agent_enabled": self.agent_enabled,
                 "rtc_phase": self._rtc_phase,
                 "rtc_session": self._rtc_session,
                 "rtc_utterance_id": self._rtc_utterance_id,
@@ -1823,6 +1887,48 @@ class ClipRuntime:
                 except Exception:
                     pass
 
+    async def _exchange_session(self, request: IngestRequest, result: Any) -> None:
+        """Device-gateway path for a stopped session: keep the Ogg, skip the AI.
+
+        The re-containerized session audio is the deliverable, so it is left in
+        place (unlike the agent path, which deletes it after transcribing) and
+        announced with a ``session_audio`` event pointing at its URL.
+        """
+        sid = request.session_id
+        device = self.device_id
+        try:
+            ogg_path = await asyncio.to_thread(self.ogg_converter, result.output_dir)
+            size = await asyncio.to_thread(lambda path=Path(ogg_path): path.stat().st_size)
+        except Exception as exc:
+            logger.exception("clip session audio exchange failed for %s: %s", sid, exc)
+            store.mark_failed(device, sid, str(exc))
+            self._push_event(
+                {"type": "workflow", "session": sid, "status": "failed", "error": str(exc)}
+            )
+            self._retain_failed_artifacts()
+            return
+        store.mark_completed(
+            device,
+            sid,
+            transcript="",
+            response="",
+            conversation_id=request.conversation_id,
+            trigger=request.trigger,
+        )
+        self._push_event(
+            {"type": "workflow", "session": sid, "status": "completed", "mode": "exchange"}
+        )
+        self._push_event(
+            {
+                "type": "session_audio",
+                "session": sid,
+                "url": session_audio_url(sid),
+                "bytes": size,
+                "content_type": "audio/ogg",
+                "trigger": request.trigger,
+            }
+        )
+
     async def _process_ingest(self, request: IngestRequest) -> None:
         sid = request.session_id
         device = self.device_id
@@ -1899,6 +2005,9 @@ class ClipRuntime:
 
         store.mark_status(device, sid, "processing")
         self._push_event({"type": "workflow", "session": sid, "status": "processing"})
+        if not self.agent_enabled:
+            await self._exchange_session(request, result)
+            return
         try:
             ogg_path = self.ogg_converter(result.output_dir)
             conversation_id = request.conversation_id or self._active_conversation

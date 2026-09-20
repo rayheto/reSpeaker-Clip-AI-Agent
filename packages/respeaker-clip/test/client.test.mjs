@@ -206,6 +206,94 @@ test('subscribe dispatches every named event', async () => {
   ]);
 });
 
+function audioResponse(bytes, status = 200) {
+  const payload = new Uint8Array(bytes);
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    arrayBuffer: async () => payload.buffer,
+    text: async () => JSON.stringify({ error: 'no audio retained' }),
+  };
+}
+
+test('utterance and session audio URLs point at the exchange endpoints', () => {
+  const client = new ClipClient({ baseUrl: 'http://clip.local:5000/' });
+  assert.equal(
+    client.utteranceAudioUrl('20260920101234', 4),
+    'http://clip.local:5000/api/clip/utterances/20260920101234/4/audio',
+  );
+  assert.equal(
+    client.sessionAudioUrl('20260920101234'),
+    'http://clip.local:5000/api/clip/sessions/20260920101234/audio',
+  );
+});
+
+test('audio can be downloaded as bytes', async () => {
+  const fetch = stubFetch(() => audioResponse([0x4f, 0x67, 0x67, 0x53]));
+  const client = new ClipClient({ fetch });
+
+  const utterance = new Uint8Array(await client.utteranceAudio('20260920101234', 4));
+  assert.deepEqual([...utterance], [0x4f, 0x67, 0x67, 0x53]);
+  assert.match(fetch.calls[0].url, /\/api\/clip\/utterances\/20260920101234\/4\/audio$/);
+  assert.match(fetch.calls[0].init.headers.Accept, /audio\/ogg/);
+
+  const session = new Uint8Array(await client.sessionAudio('20260920101234'));
+  assert.equal(session.length, 4);
+  assert.match(fetch.calls[1].url, /\/api\/clip\/sessions\/20260920101234\/audio$/);
+});
+
+test('a missing recording maps to a typed error', async () => {
+  const fetch = stubFetch(() => audioResponse([], 404));
+  const client = new ClipClient({ fetch });
+
+  await assert.rejects(() => client.utteranceAudio('20260920101234', 9), (error) => {
+    assert.ok(error instanceof ClipApiError);
+    assert.equal(error.status, 404);
+    assert.equal(error.message, 'no audio retained');
+    return true;
+  });
+});
+
+test('audio helpers validate ids before touching the network', async () => {
+  const fetch = stubFetch(() => audioResponse([]));
+  const client = new ClipClient({ fetch });
+
+  await assert.rejects(() => client.sessionAudio('nope'), /invalid session_id/);
+  await assert.rejects(() => client.utteranceAudio('nope', 1), /invalid session_id/);
+  await assert.rejects(() => client.utteranceAudio('20260920101234', -1), /invalid utterance id/);
+  assert.equal(fetch.calls.length, 0);
+});
+
+test('subscribe dispatches device-gateway audio events', async () => {
+  const stream = [
+    'id: 1\nevent: rtc_state\ndata: {"phase": "capturing", "utterance_id": 4}\n\n',
+    'id: 2\nevent: utterance_audio\ndata: {"utterance_id": 4, "session": "20260920101234", "url": "/api/clip/utterances/20260920101234/4/audio", "bytes": 4096, "content_type": "audio/ogg", "trigger": "device"}\n\n',
+    'id: 3\nevent: session_audio\ndata: {"session": "20260920101234", "url": "/api/clip/sessions/20260920101234/audio", "trigger": "physical"}\n\n',
+  ].join('');
+  const fetch = stubFetch(() => sseResponse(stream));
+  const client = new ClipClient({ fetch });
+
+  const seen = [];
+  await new Promise((resolve) => {
+    const sub = client.subscribe(
+      {
+        onUtteranceAudio: (event) => seen.push(['utterance', event.utterance_id, event.bytes]),
+        onSessionAudio: (event) => {
+          seen.push(['session', event.session, event.url]);
+          sub.close();
+          resolve();
+        },
+      },
+      { reconnect: false },
+    );
+  });
+
+  assert.deepEqual(seen, [
+    ['utterance', 4, 4096],
+    ['session', '20260920101234', '/api/clip/sessions/20260920101234/audio'],
+  ]);
+});
+
 test('subscribe reconnects with Last-Event-ID', async () => {
   const first = 'id: 12\nevent: token\ndata: {"text":"a"}\n\n';
   const second = 'id: 13\nevent: result\ndata: {"response":"done"}\n\n';

@@ -91,6 +91,59 @@ def test_print_config_does_not_start_the_service(capsys, monkeypatch):
     assert payload["clip_enabled"] is True
 
 
+def test_no_agent_disables_the_agent_and_narrows_the_input_mode(monkeypatch):
+    monkeypatch.delenv("VOICE_INPUT_MODE", raising=False)
+    monkeypatch.delenv("AGENT_ENABLED", raising=False)
+    args = service_cli.parse_args(["--no-agent", "--input-mode", "both"])
+    config = service_cli.resolved_config(args)
+
+    assert config["agent_enabled"] is False
+    assert config["clip_enabled"] is True
+    # 'both' would advertise browser voice, which the agent serves.
+    assert config["input_mode"] == "clip"
+
+
+def test_no_agent_exports_the_narrowed_input_mode(monkeypatch):
+    """The exported mode must match what the service actually serves."""
+    monkeypatch.setenv("VOICE_INPUT_MODE", "both")
+    service_cli.apply_environment(service_cli.parse_args(["--no-agent"]))
+    assert service_cli.os.environ["VOICE_INPUT_MODE"] == "clip"
+
+
+def test_agent_mode_keeps_both(monkeypatch):
+    """Agent mode keeps 'both': browser voice is part of the agent service."""
+    monkeypatch.setenv("VOICE_INPUT_MODE", "both")
+    monkeypatch.delenv("AGENT_ENABLED", raising=False)
+    service_cli.apply_environment(service_cli.parse_args([]))
+    assert service_cli.os.environ["VOICE_INPUT_MODE"] == "both"
+
+
+def test_no_agent_exports_the_setting(monkeypatch):
+    monkeypatch.delenv("AGENT_ENABLED", raising=False)
+    service_cli.apply_environment(service_cli.parse_args(["--no-agent"]))
+    assert service_cli.os.environ["AGENT_ENABLED"] == "false"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--no-agent", "--no-clip"],  # would serve nothing at all
+        ["--no-agent", "--input-mode", "browser"],  # browser voice needs the agent
+    ],
+)
+def test_no_agent_rejects_empty_deployments(argv, monkeypatch):
+    monkeypatch.delenv("VOICE_INPUT_MODE", raising=False)
+    with pytest.raises(SystemExit):
+        service_cli.parse_args(argv)
+
+
+def test_print_config_reports_agent_enabled(capsys, monkeypatch):
+    monkeypatch.delenv("VOICE_INPUT_MODE", raising=False)
+    monkeypatch.delenv("AGENT_ENABLED", raising=False)
+    assert service_cli.main(["--print-config"]) == 0
+    assert json.loads(capsys.readouterr().out)["agent_enabled"] is True
+
+
 def test_dot_env_in_the_working_directory_is_loaded(tmp_path, monkeypatch):
     """A pip install must honour ./.env, not just a checkout's .env."""
     monkeypatch.chdir(tmp_path)

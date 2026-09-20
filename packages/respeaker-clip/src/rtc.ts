@@ -16,6 +16,11 @@ export interface Utterance {
   skipped: boolean;
   /** Assistant reply, set when the result event arrives. */
   answer?: string;
+  /**
+   * Device-gateway mode (`--no-agent`): URL of this utterance's Ogg audio. The
+   * service does no STT, so this replaces the transcript/answer pair.
+   */
+  audioUrl?: string;
   conversationId?: string;
   session?: string | null;
   /** `web` (button/API) or `device` (physical double-click). */
@@ -285,7 +290,30 @@ export class RtcSessionController {
             ? this.#utterances.get(utteranceId)
             : undefined;
         if (finished) this.#options.onUtteranceResult?.(finished);
-        this.#emit();
+        return;
+      }
+      case 'utterance_audio': {
+        // Device gateway: the utterance completed as audio, not as text —
+        // no transcript and no answer are coming.
+        const data = event.data;
+        const utterance = this.#track(
+          data.utterance_id,
+          data.trigger ?? 'device',
+          data.session ?? null,
+        );
+        utterance.final = true;
+        utterance.skipped = Boolean(data.skipped) || !data.url;
+        utterance.audioUrl = data.url;
+        utterance.finishedAt = Date.now();
+        this.#current = null;
+        this.#applyState({
+          processing: false,
+          streaming: false,
+          streamingText: '',
+          tool: null,
+          phase: this.#snapshot.phase === 'capturing' ? 'capturing' : 'paused',
+        });
+        this.#options.onUtteranceResult?.(utterance);
         return;
       }
       default:

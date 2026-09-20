@@ -204,6 +204,52 @@ test('describeRtcPhase renders actionable status lines', () => {
   assert.equal(describeRtcPhase(rtc.snapshot), 'RTC error: arm failed');
 });
 
+test('device-gateway mode completes an utterance as audio', () => {
+  const results = [];
+  const { rtc } = controller({ onUtteranceResult: (utterance) => results.push(utterance) });
+  rtc.applyEvent(makeEvent('rtc_state', { phase: 'capturing', utterance_id: 21 }));
+  rtc.applyEvent(makeEvent('rtc_state', { phase: 'finalizing', utterance_id: 21 }));
+
+  rtc.applyEvent(
+    makeEvent('utterance_audio', {
+      utterance_id: 21,
+      session: '20260920101234',
+      url: '/api/clip/utterances/20260920101234/21/audio',
+      bytes: 8192,
+      content_type: 'audio/ogg',
+      trigger: 'device',
+    }),
+  );
+
+  const utterance = rtc.utterances.find((item) => item.id === 21);
+  assert.equal(utterance?.audioUrl, '/api/clip/utterances/20260920101234/21/audio');
+  assert.equal(utterance?.final, true);
+  assert.equal(utterance?.skipped, false);
+  assert.equal(utterance?.answer, undefined); // no LLM ran
+  assert.equal(results.length, 1);
+  assert.equal(rtc.snapshot.processing, false);
+  assert.equal(rtc.snapshot.streaming, false);
+  assert.equal(rtc.current, null);
+});
+
+test('a skipped device-gateway utterance yields no audio URL', () => {
+  const { rtc } = controller();
+  rtc.applyEvent(makeEvent('rtc_state', { phase: 'capturing', utterance_id: 22 }));
+
+  rtc.applyEvent(
+    makeEvent('utterance_audio', {
+      utterance_id: 22,
+      session: '20260920101234',
+      skipped: 'too short',
+    }),
+  );
+
+  const utterance = rtc.utterances.find((item) => item.id === 22);
+  assert.equal(utterance?.skipped, true);
+  assert.equal(utterance?.audioUrl, undefined);
+  assert.equal(rtc.snapshot.processing, false);
+});
+
 test('subscribers receive every snapshot', () => {
   const { rtc } = controller();
   const phases = [];

@@ -54,10 +54,12 @@ export type {
   RtcDeviceEvent,
   RtcPhase,
   RtcStateEvent,
+  SessionAudioEvent,
   StartRecordingResult,
   StopRecordingResult,
   ThinkingEvent,
   TokenEvent,
   TranscriptEvent,
+  UtteranceAudioEvent,
   WorkflowEvent,
 } from './types.js';

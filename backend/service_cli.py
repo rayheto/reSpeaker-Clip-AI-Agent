@@ -72,6 +72,16 @@ def build_parser() -> argparse.ArgumentParser:
         help="Serve the HTTP API without starting the BLE runtime.",
     )
     parser.add_argument(
+        "--no-agent",
+        action="store_true",
+        help=(
+            "Device-gateway mode: run the Clip runtime and its API only. The "
+            "agent stack (LangGraph/Groq/Mem0/Pinecone) is not loaded, no "
+            "GROQ_API_KEY is needed, and utterance audio is served over HTTP "
+            "instead of being transcribed and answered."
+        ),
+    )
+    parser.add_argument(
         "--print-config",
         action="store_true",
         help="Print the resolved configuration as JSON and exit (used by tooling).",
@@ -90,7 +100,26 @@ def _port(value: str) -> int:
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    return build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if args.no_agent and args.no_clip:
+        parser.error("--no-agent with --no-clip would serve nothing")
+    if args.no_agent and (args.input_mode or os.getenv("VOICE_INPUT_MODE")) == "browser":
+        parser.error("--no-agent cannot serve browser voice input; use --input-mode clip")
+    return args
+
+
+def effective_input_mode(args: argparse.Namespace) -> str:
+    """The input mode this process will actually serve.
+
+    ``both`` advertises browser voice, which only the agent serves, so a device
+    gateway narrows it to ``clip``. Reported and exported through one helper so
+    the service and ``--print-config`` never disagree.
+    """
+    mode = args.input_mode or os.getenv("VOICE_INPUT_MODE") or DEFAULT_INPUT_MODE
+    if args.no_agent and mode == "both":
+        return "clip"
+    return mode
 
 
 def apply_environment(args: argparse.Namespace) -> dict[str, str]:
@@ -100,7 +129,7 @@ def apply_environment(args: argparse.Namespace) -> dict[str, str]:
     anything imports :mod:`config`. Returns the values that were set.
     """
     resolved: dict[str, str] = {}
-    mode = args.input_mode or os.getenv("VOICE_INPUT_MODE") or DEFAULT_INPUT_MODE
+    mode = effective_input_mode(args)
     resolved["VOICE_INPUT_MODE"] = mode
     os.environ["VOICE_INPUT_MODE"] = mode
 
@@ -113,6 +142,9 @@ def apply_environment(args: argparse.Namespace) -> dict[str, str]:
     if args.no_clip:
         resolved["CLIP_ENABLED"] = "false"
         os.environ["CLIP_ENABLED"] = "false"
+    if args.no_agent:
+        resolved["AGENT_ENABLED"] = "false"
+        os.environ["AGENT_ENABLED"] = "false"
     return resolved
 
 
@@ -142,12 +174,19 @@ def load_environment_file(args: argparse.Namespace) -> str | None:
 
 
 def resolved_config(args: argparse.Namespace) -> dict[str, object]:
-    mode = args.input_mode or os.getenv("VOICE_INPUT_MODE") or DEFAULT_INPUT_MODE
+    mode = effective_input_mode(args)
+    agent_enabled = not args.no_agent and os.getenv("AGENT_ENABLED", "true").lower() in (
+        "1",
+        "true",
+        "yes",
+        "on",
+    )
     return {
         "host": args.host,
         "port": args.port,
         "input_mode": mode,
         "clip_enabled": not args.no_clip and mode in ("clip", "both"),
+        "agent_enabled": agent_enabled,
         "ble_address": args.ble_address or os.getenv("CLIP_BLE_ADDRESS") or None,
         "ble_name": args.ble_name or os.getenv("CLIP_BLE_NAME") or None,
     }
@@ -173,13 +212,17 @@ def main(argv: list[str] | None = None) -> int:
     from app import create_app
 
     resolved = resolved_config(args)
-    app = create_app(clip_enabled=bool(resolved["clip_enabled"]))
+    app = create_app(
+        clip_enabled=bool(resolved["clip_enabled"]),
+        agent_enabled=bool(resolved["agent_enabled"]),
+    )
     logger.info(
-        "Clip service listening on %s:%s (input_mode=%s, clip_enabled=%s, env_file=%s)",
+        "Clip service listening on %s:%s (input_mode=%s, clip_enabled=%s, agent_enabled=%s, env_file=%s)",
         resolved["host"],
         resolved["port"],
         resolved["input_mode"],
         resolved["clip_enabled"],
+        resolved["agent_enabled"],
         env_file or "-",
     )
     app.run(

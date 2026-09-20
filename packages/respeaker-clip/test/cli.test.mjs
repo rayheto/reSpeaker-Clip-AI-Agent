@@ -93,6 +93,13 @@ test('serve forwards the env file to the service', async () => {
   assert.deepEqual(plan.run.args.slice(-2), ['--env-file', '/etc/clip.env']);
 });
 
+test('serve forwards device-gateway mode', async () => {
+  const { io, out } = collect();
+  assert.equal(await main(['serve', '--dry-run', '--json', '--no-agent'], io), 0);
+  const plan = JSON.parse(out.join('\n'));
+  assert.ok(plan.run.args.includes('--no-agent'));
+});
+
 test('serve rejects an invalid port', async () => {
   const { io, err } = collect();
   assert.equal(await main(['serve', '--port', 'abc'], io), 1);

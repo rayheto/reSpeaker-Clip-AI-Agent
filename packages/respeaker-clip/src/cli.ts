@@ -42,6 +42,7 @@ serve options:
   --ble-address <addr>    Pin the Clip by BLE address
   --ble-name <name>       Scan for this BLE name instead
   --no-clip               Serve the HTTP API without the BLE runtime
+  --no-agent              Device gateway: no agent stack, no API key, audio over HTTP
   --env-file <path>       .env to load (default: ./.env in the working directory)
   --dry-run               Print the resolved plan and exit
   --json                  Machine-readable output
@@ -82,6 +83,7 @@ function parseCommandLine(argv: string[]) {
       'ble-address': { type: 'string' },
       'ble-name': { type: 'string' },
       'no-clip': { type: 'boolean' },
+      'no-agent': { type: 'boolean' },
       'env-file': { type: 'string' },
       source: { type: 'string' },
       venv: { type: 'string' },
@@ -114,6 +116,7 @@ function toServiceOptions(parsed: ParsedArgs): ServiceOptions {
   if (values['ble-address']) options.bleAddress = values['ble-address'];
   if (values['ble-name']) options.bleName = values['ble-name'];
   if (values['no-clip']) options.noClip = true;
+  if (values['no-agent']) options.noAgent = true;
   if (values['env-file']) options.envFile = values['env-file'];
   if (values.source) options.source = values.source;
   if (values.venv) options.venv = values.venv;
@@ -191,6 +194,7 @@ async function status(parsed: ParsedArgs, io: CliIo): Promise<number> {
       `  rtc utterance : ${payload.rtc_utterance_id ?? '-'}`,
       `  processing    : ${payload.rtc_processing ? 'yes' : 'no'}`,
       `  input mode    : ${payload.input_mode || '-'}`,
+      `  agent mode    : ${payload.agent_enabled === false ? 'off (device gateway)' : 'on'}`,
       `  last error    : ${payload.last_error || payload.rtc_error || '-'}`,
     ];
     io.out(lines.join('\n'));

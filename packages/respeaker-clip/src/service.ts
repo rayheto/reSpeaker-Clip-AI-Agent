@@ -35,6 +35,12 @@ export interface ServiceOptions {
   /** Run the HTTP API without the BLE runtime (browser voice only). */
   noClip?: boolean;
   /**
+   * Device-gateway mode: run the Clip runtime and its API only. The agent stack
+   * is not loaded, no `GROQ_API_KEY` is needed, and utterance audio is served
+   * over HTTP instead of being transcribed and answered.
+   */
+  noAgent?: boolean;
+  /**
    * `.env` file the service should load. Defaults to `./.env` in the service
    * working directory; real environment variables always take precedence.
    */
@@ -105,6 +111,7 @@ export function serviceArgs(options: ServiceOptions = {}): string[] {
   if (options.bleAddress) args.push('--ble-address', options.bleAddress);
   if (options.bleName) args.push('--ble-name', options.bleName);
   if (options.noClip) args.push('--no-clip');
+  if (options.noAgent) args.push('--no-agent');
   if (options.envFile) args.push('--env-file', options.envFile);
   if (options.extraArgs?.length) args.push(...options.extraArgs);
   return args;

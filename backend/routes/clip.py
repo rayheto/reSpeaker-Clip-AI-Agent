@@ -10,10 +10,14 @@ keep everything deterministic (no real BLE in tests).
 from __future__ import annotations
 
 import json
-import re
 
-from flask import Blueprint, Response, current_app, jsonify, request
+from flask import Blueprint, Response, current_app, jsonify, request, send_file
 
+from backend.clip.audio_paths import (
+    SESSION_RE,
+    session_audio_path,
+    utterance_audio_path,
+)
 from backend.clip.exceptions import (
     ClipCommandFailedError,
     ClipConflictError,
@@ -24,7 +28,7 @@ from backend.clip.exceptions import (
 
 clip_bp = Blueprint("clip", __name__)
 
-_SESSION_RE = re.compile(r"^\d{14}$")
+_SESSION_RE = SESSION_RE
 
 
 def _worker():
@@ -185,3 +189,31 @@ def clip_context():
         raise ClipInputError("conversation_id must be a string")
     worker.register_context(conversation_id)
     return jsonify({"accepted": True, "conversation_id": conversation_id}), 200
+
+
+# -- audio exchange ----------------------------------------------------------
+# With the agent disabled the service is a device gateway: it re-containerizes
+# audio to Ogg and serves it here instead of transcribing and answering. The
+# paths are derived from the ids (never from caller input), so a request can
+# only ever reach a file this service wrote itself.
+
+@clip_bp.route("/clip/sessions/<session_id>/audio", methods=["GET"])
+def clip_session_audio(session_id: str):
+    """The re-containerized Ogg of a downloaded session, while it is retained."""
+    _validate_session_id(session_id)
+    path = session_audio_path(session_id)
+    if not path.is_file():
+        return jsonify({"error": "no audio retained for this session"}), 404
+    return send_file(path, mimetype="audio/ogg", conditional=True)
+
+
+@clip_bp.route("/clip/utterances/<session_id>/<int:utterance_id>/audio", methods=["GET"])
+def clip_utterance_audio(session_id: str, utterance_id: int):
+    """The Ogg snapshot of one RTC utterance (device-gateway mode)."""
+    _validate_session_id(session_id)
+    if utterance_id < 0:
+        raise ClipInputError("invalid utterance_id")
+    path = utterance_audio_path(session_id, utterance_id)
+    if not path.is_file():
+        return jsonify({"error": "no audio retained for this utterance"}), 404
+    return send_file(path, mimetype="audio/ogg", conditional=True)

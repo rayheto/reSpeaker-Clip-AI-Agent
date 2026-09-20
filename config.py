@@ -36,6 +36,15 @@ class Settings:
     CLIP_TEMP_DIR: str = os.getenv("CLIP_TEMP_DIR", "clip_audio")
     CLIP_MAX_FAILED_ARTIFACTS: int = int(os.getenv("CLIP_MAX_FAILED_ARTIFACTS", "5"))
 
+    # --- Deployment scope ---
+    # When false the service runs as a device gateway only: the Clip runtime,
+    # its HTTP API and the audio-exchange path load, and the agent stack
+    # (LangGraph/Groq/Mem0/Pinecone/Supabase conversations) is neither imported
+    # nor started. Utterances and downloaded sessions are re-containerized to
+    # Ogg, kept on disk and announced over SSE instead of being transcribed
+    # and answered; no GROQ_API_KEY is required.
+    AGENT_ENABLED: bool = os.getenv("AGENT_ENABLED", "true").lower() in ("1", "true", "yes", "on")
+
     # --- reSpeaker Clip RTC live streaming (AT+START=rtc) ---
     # One RTC session stays armed for the whole process: the firmware mic
     # pipeline runs warm while it emits nothing over BLE during warm pauses.

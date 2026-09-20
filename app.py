@@ -5,9 +5,7 @@ from flask import Flask, jsonify, render_template, send_from_directory
 from flask_cors import CORS
 from jinja2 import TemplateNotFound
 from backend.routes import register_routes
-from backend.database import init_db
 from backend.clip.store import init_clip_ingestions
-from backend.vector import init_index
 from backend.clip.worker import ClipWorker
 from config import settings
 
@@ -31,7 +29,47 @@ def start_clip_worker(app, factory=None) -> ClipWorker | None:
     return worker
 
 
-def create_app(clip_enabled: bool | None = None, clip_factory=None) -> Flask:
+def endpoint_index(reason: str):
+    """JSON index of the API, served when the web UI is absent or unwanted."""
+    return (
+        jsonify(
+            {
+                "service": "reSpeaker Clip",
+                "web_ui": False,
+                "reason": reason,
+                "endpoints": [
+                    "/api/clip/status",
+                    "/api/clip/events",
+                    "/api/clip/recordings/start",
+                    "/api/clip/recordings/stop",
+                    "/api/clip/stream/resume",
+                    "/api/clip/stream/pause",
+                    "/api/clip/sessions/<session_id>/ingest",
+                    "/api/clip/sessions/<session_id>/audio",
+                    "/api/clip/utterances/<session_id>/<utterance_id>/audio",
+                    "/api/clip/context",
+                ],
+            }
+        ),
+        200,
+    )
+
+
+def create_app(
+    clip_enabled: bool | None = None,
+    clip_factory=None,
+    agent_enabled: bool | None = None,
+) -> Flask:
+    """Build the Flask app.
+
+    ``agent_enabled=False`` produces a device-gateway app: the Clip runtime and
+    its HTTP API (plus health) only. The agent stack — LangGraph, Groq, Mem0,
+    Pinecone, the conversation store and its routes — is neither imported nor
+    started, no API key is required, and utterances are exchanged as audio
+    rather than transcribed and answered.
+    """
+    if agent_enabled is None:
+        agent_enabled = settings.AGENT_ENABLED
     app = Flask(
         __name__,
         static_folder="frontend/static",
@@ -39,10 +77,16 @@ def create_app(clip_enabled: bool | None = None, clip_factory=None) -> Flask:
     )
     CORS(app)
 
-    register_routes(app)
-    init_db()
+    register_routes(app, agent_enabled=agent_enabled)
     init_clip_ingestions()
-    init_index()
+    if agent_enabled:
+        # Imported late so a device gateway never loads the conversation store
+        # or the vector client (init_index also calls Pinecone at startup).
+        from backend.database import init_db
+        from backend.vector import init_index
+
+        init_db()
+        init_index()
 
     if clip_enabled is None:
         clip_enabled = settings.VOICE_INPUT_MODE in ("clip", "both")
@@ -51,6 +95,10 @@ def create_app(clip_enabled: bool | None = None, clip_factory=None) -> Flask:
 
     @app.route("/")
     def index():
+        if not agent_enabled:
+            # Device gateway: there is no chat UI to serve, so point callers at
+            # the API instead of rendering the (agent-driven) web client.
+            return endpoint_index("agent disabled: device gateway")
         try:
             return render_template(
                 "index.html",
@@ -63,25 +111,7 @@ def create_app(clip_enabled: bool | None = None, clip_factory=None) -> Flask:
         except TemplateNotFound:
             # Installed as a package the bundled web UI is absent; the service
             # is then API-only (the npm SDK, or any HTTP client, drives it).
-            return (
-                jsonify(
-                    {
-                        "service": "reSpeaker Clip",
-                        "web_ui": False,
-                        "endpoints": [
-                            "/api/clip/status",
-                            "/api/clip/events",
-                            "/api/clip/recordings/start",
-                            "/api/clip/recordings/stop",
-                            "/api/clip/stream/resume",
-                            "/api/clip/stream/pause",
-                            "/api/clip/sessions/<session_id>/ingest",
-                            "/api/clip/context",
-                        ],
-                    }
-                ),
-                200,
-            )
+            return endpoint_index("web UI not bundled")
 
     @app.route("/static/<path:filename>")
     def static_files(filename):

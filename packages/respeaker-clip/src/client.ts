@@ -17,6 +17,8 @@ import type {
   TokenEvent,
   TranscriptEvent,
   ConnectionEvent,
+  SessionAudioEvent,
+  UtteranceAudioEvent,
   WorkflowEvent,
 } from './types.js';
 
@@ -45,6 +47,10 @@ export interface SubscribeHandlers {
   onTranscript?: (event: TranscriptEvent) => void;
   onThinking?: (event: ThinkingEvent) => void;
   onToken?: (event: TokenEvent) => void;
+  /** Device gateway: one utterance's Ogg is ready to fetch. */
+  onUtteranceAudio?: (event: UtteranceAudioEvent) => void;
+  /** Device gateway: a downloaded session's Ogg is ready to fetch. */
+  onSessionAudio?: (event: SessionAudioEvent) => void;
   /** Every named event, after the specific handler. */
   onEvent?: (event: ClipEvent) => void;
   /** Transport-level failures; the subscription reconnects unless disabled. */
@@ -195,12 +201,7 @@ export class ClipClient {
     signal?: AbortSignal,
   ): Promise<IngestResult> {
     if (!SESSION_ID_RE.test(sessionId)) {
-      return Promise.reject(
-        new ClipApiError(`invalid session_id: ${JSON.stringify(sessionId)} (expected 14 digits)`, {
-          code: 'bad_input',
-          status: 400,
-        }),
-      );
+      return Promise.reject(invalidSessionId(sessionId));
     }
     return this.#request<IngestResult>(
       'POST',
@@ -216,6 +217,45 @@ export class ClipClient {
     signal?: AbortSignal,
   ): Promise<{ accepted: boolean; conversation_id: string }> {
     return this.#request('POST', '/api/clip/context', { conversation_id: conversationId }, signal);
+  }
+
+  /**
+   * URL of one utterance's Ogg. In device-gateway mode (`--no-agent`) the
+   * `utterance_audio` event carries exactly this path; the bytes are the raw
+   * audio for the consumer to transcribe.
+   */
+  utteranceAudioUrl(sessionId: string, utteranceId: number): string {
+    return `${this.baseUrl}/api/clip/utterances/${sessionId}/${utteranceId}/audio`;
+  }
+
+  /** URL of a downloaded session's re-containerized Ogg. */
+  sessionAudioUrl(sessionId: string): string {
+    return `${this.baseUrl}/api/clip/sessions/${sessionId}/audio`;
+  }
+
+  /** Download one utterance's Ogg bytes (device-gateway mode). */
+  utteranceAudio(
+    sessionId: string,
+    utteranceId: number,
+    signal?: AbortSignal,
+  ): Promise<ArrayBuffer> {
+    if (!SESSION_ID_RE.test(sessionId)) {
+      return Promise.reject(invalidSessionId(sessionId));
+    }
+    if (!Number.isInteger(utteranceId) || utteranceId < 0) {
+      return Promise.reject(
+        new ClipApiError(`invalid utterance id: ${utteranceId}`, { code: 'bad_input', status: 400 }),
+      );
+    }
+    return this.#requestBytes(`/api/clip/utterances/${sessionId}/${utteranceId}/audio`, signal);
+  }
+
+  /** Download a downloaded session's Ogg bytes. */
+  sessionAudio(sessionId: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+    if (!SESSION_ID_RE.test(sessionId)) {
+      return Promise.reject(invalidSessionId(sessionId));
+    }
+    return this.#requestBytes(`/api/clip/sessions/${sessionId}/audio`, signal);
   }
 
   /**
@@ -307,6 +347,12 @@ export class ClipClient {
             break;
           case 'token':
             handlers.onToken?.(event.data as TokenEvent);
+            break;
+          case 'utterance_audio':
+            handlers.onUtteranceAudio?.(event.data as UtteranceAudioEvent);
+            break;
+          case 'session_audio':
+            handlers.onSessionAudio?.(event.data as SessionAudioEvent);
             break;
           default:
             break;
@@ -444,9 +490,48 @@ export class ClipClient {
       init.body = JSON.stringify(payload);
     }
 
-    let response: Response;
+    const response = await this.#send(method, path, init, timing, signal);
+    const parsed = await safeJson(response);
+    if (!response.ok) {
+      throw ClipApiError.fromResponse(
+        response.status,
+        parsed,
+        `${method} ${path} failed with HTTP ${response.status}`,
+      );
+    }
+    return (parsed ?? {}) as T;
+  }
+
+  /** GET raw bytes (audio exchange). */
+  async #requestBytes(path: string, signal?: AbortSignal): Promise<ArrayBuffer> {
+    const timing = combineSignals(signal, this.timeoutMs);
+    const init: RequestInit = {
+      method: 'GET',
+      headers: { Accept: 'audio/ogg, application/octet-stream', ...this.#headers },
+      signal: timing.signal,
+    };
+
+    const response = await this.#send('GET', path, init, timing, signal);
+    if (!response.ok) {
+      throw ClipApiError.fromResponse(
+        response.status,
+        await safeJson(response),
+        `GET ${path} failed with HTTP ${response.status}`,
+      );
+    }
+    return await response.arrayBuffer();
+  }
+
+  /** Perform one request, mapping transport failures to typed errors. */
+  async #send(
+    method: string,
+    path: string,
+    init: RequestInit,
+    timing: Timing,
+    signal?: AbortSignal,
+  ): Promise<Response> {
     try {
-      response = await this.#fetch(`${this.baseUrl}${path}`, init);
+      return await this.#fetch(`${this.baseUrl}${path}`, init);
     } catch (error) {
       if (timing.timedOut()) {
         throw new ClipApiError(`request to ${path} timed out after ${this.timeoutMs}ms`, {
@@ -464,17 +549,14 @@ export class ClipClient {
     } finally {
       timing.cleanup();
     }
-
-    const parsed = await safeJson(response);
-    if (!response.ok) {
-      throw ClipApiError.fromResponse(
-        response.status,
-        parsed,
-        `${method} ${path} failed with HTTP ${response.status}`,
-      );
-    }
-    return (parsed ?? {}) as T;
   }
+}
+
+function invalidSessionId(sessionId: string): ClipApiError {
+  return new ClipApiError(
+    `invalid session_id: ${JSON.stringify(sessionId)} (expected 14 digits)`,
+    { code: 'bad_input', status: 400 },
+  );
 }
 
 async function safeJson(response: Response): Promise<unknown> {

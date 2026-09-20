@@ -61,6 +61,8 @@ export interface ClipStatus {
   last_error?: string | null;
   input_mode?: 'browser' | 'clip' | 'both' | string;
   record_mode?: 'normal' | 'enhanced' | string;
+  /** False when the service runs as a device gateway (no agent, no STT). */
+  agent_enabled?: boolean;
   rtc_phase?: RtcPhase;
   rtc_session?: string | null;
   rtc_utterance_id?: number | null;
@@ -130,6 +132,34 @@ export interface TokenEvent {
   text: string;
 }
 
+/**
+ * Device-gateway mode only: the Ogg snapshot of one finalized utterance.
+ * Emitted instead of `transcript`/`result` when the service runs without the
+ * agent (`--no-agent`), so the consumer does its own ASR.
+ */
+export interface UtteranceAudioEvent {
+  utterance_id: number;
+  session?: string | null;
+  /** Fetchable Ogg URL; absent when the utterance was skipped or failed. */
+  url?: string;
+  bytes?: number;
+  content_type?: string;
+  trigger?: string;
+  /** Set when no audio was produced at all (e.g. `too short`). */
+  skipped?: string;
+  error?: string;
+}
+
+/** Device-gateway mode only: the Ogg of a downloaded SD session. */
+export interface SessionAudioEvent {
+  session: string;
+  url: string;
+  bytes?: number;
+  content_type?: string;
+  trigger?: string;
+  error?: string;
+}
+
 /** Named events carried by `GET /api/clip/events`. */
 export interface ClipEventMap {
   connection: ConnectionEvent;
@@ -141,6 +171,8 @@ export interface ClipEventMap {
   transcript: TranscriptEvent;
   thinking: ThinkingEvent;
   token: TokenEvent;
+  utterance_audio: UtteranceAudioEvent;
+  session_audio: SessionAudioEvent;
 }
 
 export type ClipEventName = keyof ClipEventMap;
