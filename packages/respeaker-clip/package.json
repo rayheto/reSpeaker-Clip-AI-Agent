@@ -50,7 +50,8 @@
   "files": [
     "bin",
     "dist",
-    "README.md"
+    "README.md",
+    "DEPLOYMENT.md"
   ],
   "scripts": {
     "build": "node scripts/build.mjs",

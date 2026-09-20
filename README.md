@@ -437,7 +437,11 @@ npx respeaker-clip status --base-url http://localhost:5000
   service source (`--source`, or the `respeaker-clip-service` pip distribution),
   creates a dedicated virtualenv, installs into it, and launches
   `python -m backend.service_cli`, forwarding `--host/--port/--input-mode` and
-  the rest of the environment.
+  the rest of the environment. It reads a `.env` from the directory it runs in
+  (or `--env-file`), and real environment variables take precedence.
+- **Deployment guide** — systemd unit, BLE/D-Bus permissions, nginx for the SSE
+  stream, security notes (the API has no auth and CORS is open), upgrades and a
+  troubleshooting table: [`packages/respeaker-clip/DEPLOYMENT.md`](packages/respeaker-clip/DEPLOYMENT.md).
 
 The Python side has its own distribution metadata (`pyproject.toml`, console
 script `respeaker-clip-service`, `python -m backend.service_cli`), so the service

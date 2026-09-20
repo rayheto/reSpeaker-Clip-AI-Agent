@@ -130,15 +130,25 @@ npx respeaker-clip status --base-url http://localhost:5000
 | `--input-mode` | `clip` | `browser` \| `clip` \| `both` |
 | `--ble-address` / `--ble-name` | from env | Pin or discover the device |
 | `--no-clip` | — | Serve the HTTP API without the BLE runtime |
+| `--env-file <path>` | `./.env` | Configuration file to load (real env vars win) |
 | `--dry-run` / `--json` | — | Print the resolved plan and exit |
 | `-- <args…>` | — | Extra arguments forwarded to the service |
 
 Environment: `RESPEAKER_CLIP_HOME`, `RESPEAKER_CLIP_PIP_SPEC`,
-`RESPEAKER_CLIP_PYTHON`, `RESPEAKER_CLIP_SERVICE_ROOT`, `RESPEAKER_CLIP_BASE_URL`.
+`RESPEAKER_CLIP_PYTHON`, `RESPEAKER_CLIP_SERVICE_ROOT`,
+`RESPEAKER_CLIP_ENV_FILE`, `RESPEAKER_CLIP_BASE_URL`.
 
-The service itself reads the usual `.env` (`GROQ_API_KEY`, `CLIP_BLE_ADDRESS`, …).
+The service reads a `.env` from the **directory you run it in** (or `--env-file`);
+variables already in the environment always take precedence, so systemd
+`EnvironmentFile=` and container env override the file. `.env` carries
+`GROQ_API_KEY`, `CLIP_BLE_ADDRESS`, `VOICE_INPUT_MODE`, the `RTC_*` tuning and
+`DATABASE_URL` — see `.env.example` in the repository.
+
 `respeaker-clip status` exits `0` when the Clip is connected, `3` when the
 service answers but the device is offline, and `1` on transport errors.
+
+Deploying it as a service (systemd unit, BLE permissions, reverse proxy for SSE,
+troubleshooting) is covered in **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
 
 ### Prerequisites for BLE voice input
 
