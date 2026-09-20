@@ -71,6 +71,74 @@ rtc.lastResult;   // result of an SD-session (non-utterance) reply
 `phase` is one of `disconnected | arming | paused | capturing | finalizing | stopped`.
 `describeRtcPhase(snapshot)` renders the same status lines the reference web UI uses.
 
+### Device gateway mode (no agent)
+
+If you only want the Clip as a voice input — and your own backend, ASR or
+pipeline does the thinking — run the service with the agent switched off:
+
+```bash
+npx respeaker-clip serve --source /path/to/reSpeaker-Clip-AI-Agent --no-agent
+```
+
+In this mode the service is a **device gateway**:
+
+- the agent stack (LangGraph, Groq, Mem0, Pinecone, the conversation store) is
+  never imported or started, and **no `GROQ_API_KEY` is needed**;
+- only `/api/health` and `/api/clip/*` are registered — no `/api/chat`,
+  `/api/voice`, `/api/tts`, `/api/composio`;
+- there is **no transcription and no LLM**: each finalized utterance and each
+  downloaded session is re-containerized to Ogg, kept on disk and announced
+  over SSE.
+
+```js
+import { ClipClient } from 'respeaker-clip';
+
+const clip = new ClipClient({ baseUrl: 'http://localhost:5000' });
+
+const sub = clip.subscribe({
+  onUtteranceAudio: async (event) => {
+    if (!event.url) return;                 // skipped: too short to keep
+    const ogg = await clip.utteranceAudio(event.session, event.utterance_id);
+    myOwnStt(ogg).then(myOwnAgent);
+  },
+  onSessionAudio: async (event) => {
+    // A stopped SD recording finished downloading and is on disk.
+    const ogg = await clip.sessionAudio(event.session);
+    myOwnStt(ogg).then(myOwnAgent);
+  },
+});
+
+await clip.streamResume();   // or double-click the device
+// …speak…
+await clip.streamPause();    // → one utterance_audio event
+```
+
+Events in this mode:
+
+| Event | Payload |
+| --- | --- |
+| `utterance_audio` | `{ utterance_id, session, url, bytes, content_type, trigger }`, or `{ skipped: "too short" }` when nothing was kept |
+| `session_audio` | `{ session, url, bytes, content_type, trigger }` |
+
+Audio is fetched from the URLs in those events:
+
+| Endpoint | Returns |
+| --- | --- |
+| `GET /api/clip/utterances/<session_id>/<utterance_id>/audio` | One utterance's Ogg |
+| `GET /api/clip/sessions/<session_id>/audio` | A downloaded session's Ogg (404 once cleaned up) |
+
+`clip.utteranceAudio(session, id)` / `clip.sessionAudio(session)` fetch the bytes
+for you; `clip.utteranceAudioUrl(...)` / `clip.sessionAudioUrl(...)` return the
+paths. `RtcSessionController` folds `utterance_audio` the same way it folds a
+transcript result — the utterance gets `final: true` plus an `audioUrl`.
+
+The agent path deletes session audio after transcribing; gateway mode **keeps
+every file**, so `clip_audio/` (`CLIP_TEMP_DIR`) grows with use — clean it up on
+your own schedule or point it at a volume you manage.
+
+`--no-agent` refuses to combine with `--no-clip` (nothing would be served) and
+with `--input-mode browser` (browser voice needs the agent).
+
 ### REST methods
 
 | Method | Endpoint |
@@ -130,6 +198,7 @@ npx respeaker-clip status --base-url http://localhost:5000
 | `--input-mode` | `clip` | `browser` \| `clip` \| `both` |
 | `--ble-address` / `--ble-name` | from env | Pin or discover the device |
 | `--no-clip` | — | Serve the HTTP API without the BLE runtime |
+| `--no-agent` | — | Device gateway: no agent stack, no API key, audio over HTTP (see above) |
 | `--env-file <path>` | `./.env` | Configuration file to load (real env vars win) |
 | `--dry-run` / `--json` | — | Print the resolved plan and exit |
 | `-- <args…>` | — | Extra arguments forwarded to the service |

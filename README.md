@@ -233,6 +233,7 @@ Copy `.env.example` to `.env` and fill in the values. Only `GROQ_API_KEY` is str
 | `CLIP_DOWNLOAD_TIMEOUT` | `300`                      | Per-session download timeout (s)     |
 | `CLIP_TEMP_DIR`         | `clip_audio`               | Local temp audio dir                 |
 | `CLIP_MAX_FAILED_ARTIFACTS` | `5`                   | Bounded failed-artifact retention    |
+| `AGENT_ENABLED`            | `true`                | `false` = device gateway (no agent, no STT; audio over HTTP) |
 | `RTC_AUTO_ARM`             | `true`                | Auto-arm the RTC session on connect  |
 | `RTC_ARM_TIMEOUT`          | `15`                  | Bounded wait for the RTC stream start|
 | `RTC_SETTLE_SECONDS`       | `1.0`                 | Ignore stale initial state events    |
@@ -286,6 +287,8 @@ Paste your key into `.env`. On startup the app auto-creates the `conversations` 
 | POST   | `/api/clip/stream/resume`    | Resume the armed RTC session (next utterance) |
 | POST   | `/api/clip/stream/pause`     | Warm-pause the RTC session (finalize utterance) |
 | POST   | `/api/clip/sessions/<session_id>/ingest` | Idempotent retry/enqueue of a session |
+| GET    | `/api/clip/sessions/<session_id>/audio` | Retained session Ogg (device gateway) |
+| GET    | `/api/clip/utterances/<session_id>/<utterance_id>/audio` | Retained utterance Ogg (device gateway) |
 | POST   | `/api/clip/context`| `{conversation_id}` register the active conversation |
 | GET    | `/api/composio/toolkits` | List available + selected Composio toolkits   |
 | POST   | `/api/composio/toolkits` | `{toolkits: [...]}` — set and persist selection |
@@ -306,6 +309,17 @@ event: result      data: {"session": "...", "conversation_id": "...", "transcrip
 event: rtc_state   data: {"phase": "arming|paused|capturing|finalizing|stopped|disconnected", "session": "...", "utterance_id": 4, "trigger": "web|device"}
 event: transcript  data: {"utterance_id": 4, "text": "...", "final": false|true}
 ```
+
+Agent mode additionally emits `thinking` and `token` while the reply streams; with
+`AGENT_ENABLED=false` (device gateway) no transcript is produced and the audio is
+announced instead:
+
+```
+event: utterance_audio data: {"utterance_id": 4, "session": "...", "url": "/api/clip/utterances/<session>/4/audio", "bytes": 41216, "content_type": "audio/ogg", "trigger": "device"}
+event: session_audio   data: {"session": "...", "url": "/api/clip/sessions/<session>/audio", "bytes": 80128, "trigger": "physical"}
+```
+
+An utterance too short to keep arrives as `{"utterance_id": 4, "skipped": "too short"}`.
 
 SSE event format:
 
@@ -439,6 +453,11 @@ npx respeaker-clip status --base-url http://localhost:5000
   `python -m backend.service_cli`, forwarding `--host/--port/--input-mode` and
   the rest of the environment. It reads a `.env` from the directory it runs in
   (or `--env-file`), and real environment variables take precedence.
+- **Device gateway mode** — `respeaker-clip serve --no-agent` runs the Clip
+  runtime and its API only: the agent stack is never imported, no
+  `GROQ_API_KEY` is needed, and each finalized utterance / downloaded session is
+  re-containerized to Ogg and served over HTTP (`utterance_audio` and
+  `session_audio` events) instead of being transcribed and answered.
 - **Deployment guide** — systemd unit, BLE/D-Bus permissions, nginx for the SSE
   stream, security notes (the API has no auth and CORS is open), upgrades and a
   troubleshooting table: [`packages/respeaker-clip/DEPLOYMENT.md`](packages/respeaker-clip/DEPLOYMENT.md)

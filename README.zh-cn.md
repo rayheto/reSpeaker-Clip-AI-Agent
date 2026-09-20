@@ -195,6 +195,7 @@ Clip 网页按钮为按住录音、松开停止；物理按键同样可以开始
 | `CLIP_STATUS_INTERVAL`   | `5`                        | 状态心跳间隔（秒）                   |
 | `CLIP_DOWNLOAD_TIMEOUT`  | `300`                      | 单会话下载超时（秒）                 |
 | `CLIP_TEMP_DIR`          | `clip_audio`               | 本地临时音频目录                     |
+| `AGENT_ENABLED`          | `true`                     | `false` = 设备网关（无 agent、无 STT，音频走 HTTP） |
 | `CLIP_MAX_FAILED_ARTIFACTS` | `5`                     | 失败产物保留数量上限                 |
 
 ### 可选的一次性设置
@@ -236,6 +237,10 @@ Clip 网页按钮为按住录音、松开停止；物理按键同样可以开始
 | POST   | `/api/clip/recordings/start` | `{mode?, conversation_id?}` 开始录音          |
 | POST   | `/api/clip/recordings/stop`  | 停止，返回 accepted/session 工作流数据       |
 | POST   | `/api/clip/sessions/<session_id>/ingest` | 会话的幂等重试/入队             |
+| POST   | `/api/clip/stream/resume`    | 恢复已武装的 RTC 会话（下一段 utterance）      |
+| POST   | `/api/clip/stream/pause`     | 温暂停 RTC 会话（结束当前 utterance）          |
+| GET    | `/api/clip/sessions/<session_id>/audio` | 保留的会话 Ogg（设备网关模式）     |
+| GET    | `/api/clip/utterances/<session_id>/<utterance_id>/audio` | 保留的 utterance Ogg（设备网关模式） |
 | POST   | `/api/clip/context`| `{conversation_id}` 注册当前活动会话               |
 | GET    | `/api/composio/toolkits` | 列出可用与已选中的 Composio 工具包       |
 | POST   | `/api/composio/toolkits` | `{toolkits: [...]}` — 设置并持久化选择   |
@@ -253,6 +258,16 @@ event: recording   data: {"action": "started|stopped", "session": "...", "trigge
 event: workflow    data: {"status": "stopped|downloading|processing|failed", "session": "..."}
 event: result      data: {"session": "...", "conversation_id": "...", "transcript": "...", "response": "..."}
 ```
+
+agent 模式还会在回复流式生成时发送 `thinking` 与 `token` 事件；当
+`AGENT_ENABLED=false`（设备网关模式）时不产生转写，而是改为通知音频：
+
+```
+event: utterance_audio data: {"utterance_id": 4, "session": "...", "url": "/api/clip/utterances/<session>/4/audio", "bytes": 41216, "content_type": "audio/ogg", "trigger": "device"}
+event: session_audio   data: {"session": "...", "url": "/api/clip/sessions/<session>/audio", "bytes": 80128, "trigger": "physical"}
+```
+
+太短而不保留的 utterance 会收到 `{"utterance_id": 4, "skipped": "too short"}`。
 
 SSE 事件格式：
 
@@ -357,6 +372,10 @@ npx respeaker-clip status --base-url http://localhost:5000
   `respeaker-clip-service` pip 包），创建独立虚拟环境、安装，然后启动
   `python -m backend.service_cli`，并转发 `--host/--port/--input-mode` 及其余环境。
   它读取所在目录的 `.env`（或用 `--env-file` 指定），真实环境变量优先。
+- **设备网关模式** — `respeaker-clip serve --no-agent` 只运行 Clip 运行时及其 API：
+  不导入 agent 技术栈、不需要 `GROQ_API_KEY`，每段 utterance 与每个下载的会话都被
+  重新封装为 Ogg 并通过 HTTP 提供（`utterance_audio`、`session_audio` 事件），
+  而不是被转写和回答。
 - **部署文档** — systemd unit、BLE/D-Bus 权限、SSE 的 nginx 配置、安全说明
   （API 无鉴权且 CORS 全开）、升级与故障排查表：
   [`packages/respeaker-clip/DEPLOYMENT.zh-cn.md`](packages/respeaker-clip/DEPLOYMENT.zh-cn.md)

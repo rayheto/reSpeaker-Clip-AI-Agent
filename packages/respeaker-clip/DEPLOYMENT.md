@@ -21,7 +21,7 @@ stop thinking about Node.
 | Python ≥ 3.10 **with `venv`** | the service itself (Debian/Ubuntu: `sudo apt install python3-venv`) | `python3 -m venv --help` |
 | Bluetooth host (Linux + BlueZ, or Windows) | the Clip talks BLE | `bluetoothctl power on` |
 | A Clip, powered and paired | voice input | `bluetoothctl devices` |
-| `GROQ_API_KEY` | LLM + Whisper STT + Orpheus TTS | see §3 |
+| `GROQ_API_KEY` | LLM + Whisper STT + Orpheus TTS (not needed with `--no-agent`, §11) | see §3 |
 | Free TCP port (default 5000) | the HTTP API | `ss -ltnp \| grep 5000` |
 
 The service **starts and serves the API even when BLE is unavailable** — it
@@ -69,6 +69,7 @@ touch pip again.
 | `--input-mode` | `clip` | `clip` (device only) \| `browser` (system mic) \| `both` |
 | `--ble-address` / `--ble-name` | from env | Pin the device, or scan by name |
 | `--no-clip` | off | Serve the API without the BLE runtime (no voice input) |
+| `--no-agent` | off | Device gateway: no agent stack, no API key, audio over HTTP (§11) |
 | `--env-file` | `./.env` | Configuration file (see §3) |
 | `--venv` / `--pip-spec` / `--skip-install` | see above | Install behaviour |
 | `-- <args…>` | — | Anything else forwarded to the service verbatim |
@@ -305,7 +306,66 @@ sudo systemctl start respeaker-clip                 # re-runs pip install for --
 
 ---
 
-## 11. Docker (sketch, not validated here)
+## 11. Device gateway: `--no-agent`
+
+Use this when you want the Clip as a voice input and **your own** ASR/agent
+downstream — the service then only runs the device and hands you audio:
+
+```bash
+respeaker-clip serve --source /opt/reSpeaker-Clip-AI-Agent --no-agent
+```
+
+What changes:
+
+- The agent stack (LangGraph, Groq, Mem0, Pinecone, the conversation store) is
+  **never imported**, so no `GROQ_API_KEY` is needed and startup makes no
+  Pinecone/Supabase conversation calls.
+- Only `/api/health` and `/api/clip/*` exist; `/api/chat`, `/api/voice`,
+  `/api/tts` and `/api/composio` return 404, and `GET /` returns the endpoint
+  index instead of the chat UI.
+- **No transcription and no reply.** Each finalized utterance and each stopped
+  SD session is re-containerized to Ogg, kept on disk and announced over SSE:
+
+  ```
+  event: utterance_audio
+  data: {"utterance_id": 4, "session": "20260920101234", "trigger": "device",
+         "url": "/api/clip/utterances/20260920101234/4/audio",
+         "bytes": 41216, "content_type": "audio/ogg"}
+  ```
+
+  An utterance that is too short to keep arrives as `{"skipped": "too short"}`
+  with no `url`.
+
+Fetch the audio from the advertised URL:
+
+```bash
+curl -o utterance.ogg http://127.0.0.1:5000/api/clip/utterances/20260920101234/4/audio
+curl -o session.ogg   http://127.0.0.1:5000/api/clip/sessions/20260920101234/audio
+```
+
+`GET /api/clip/sessions/<id>/audio` answers 404 once the file is gone, so treat
+it as "retained or already cleaned" rather than an error state.
+
+Operational notes:
+
+- The agent path deletes session audio after transcribing; gateway mode **keeps
+  every file**. `CLIP_TEMP_DIR` (`clip_audio/` by default) grows with use — size
+  the volume or prune it on a schedule you control.
+- The systemd unit in §4 works unchanged; append `--no-agent` to `ExecStart`.
+- `--no-agent` is rejected together with `--no-clip` (nothing would be served)
+  and with `--input-mode browser` (browser voice requires the agent).
+- `GET /api/clip/status` reports `"agent_enabled": false`, and
+  `respeaker-clip status` prints `agent mode : off (device gateway)` — use it to
+  confirm a deployment came up in the right mode.
+
+Verify:
+
+```bash
+respeaker-clip status --base-url http://127.0.0.1:5000 | grep 'agent mode'
+curl -s http://127.0.0.1:5000/ | jq .reason          # "agent disabled: device gateway"
+```
+
+## 12. Docker (sketch, not validated here)
 
 BLE is the hard part: the container needs the host D-Bus socket and Bluetooth
 access, which usually means `--network host`, mounting

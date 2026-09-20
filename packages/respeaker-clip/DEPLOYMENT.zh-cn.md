@@ -16,7 +16,7 @@
 | Python ≥ 3.10 且带 `venv` | 服务本体（Debian/Ubuntu：`sudo apt install python3-venv`） | `python3 -m venv --help` |
 | 蓝牙主机（Linux + BlueZ，或 Windows） | Clip 走 BLE | `bluetoothctl power on` |
 | 一个已上电、已配对的 Clip | 语音输入 | `bluetoothctl devices` |
-| `GROQ_API_KEY` | LLM + Whisper STT + Orpheus TTS | 见 §3 |
+| `GROQ_API_KEY` | LLM + Whisper STT + Orpheus TTS（用 `--no-agent` 时不需要，见 §11） | 见 §3 |
 | 空闲 TCP 端口（默认 5000） | HTTP API | `ss -ltnp \| grep 5000` |
 
 **即使 BLE 不可用，服务也会启动并对外提供 API**——它会带退避地重试，并报告 `connected: false`。所以可以在硬件到货前先部署，然后用 `respeaker-clip status` 观察它上线。
@@ -268,6 +268,59 @@ sudo systemctl start respeaker-clip                 # --source 模式下会重�
 
 ---
 
-## 11. Docker（草案，未在仓库内验证）
+## 11. 设备网关模式：`--no-agent`
+
+如果你只想把 Clip 当作语音输入，转写和后续处理由**你自己的** ASR/agent 负责，就用这个模式：
+
+```bash
+respeaker-clip serve --source /opt/reSpeaker-Clip-AI-Agent --no-agent
+```
+
+行为差异：
+
+- agent 技术栈（LangGraph、Groq、Mem0、Pinecone、对话存储）**完全不会被导入**，
+  因此不需要 `GROQ_API_KEY`，启动时也不会访问 Pinecone / Supabase 的对话数据。
+- 只有 `/api/health` 和 `/api/clip/*` 存在；`/api/chat`、`/api/voice`、`/api/tts`、
+  `/api/composio` 返回 404，`GET /` 返回端点索引而不是聊天界面。
+- **不做转写、不做回复。** 每段说完的 utterance 和每个停止的 SD 会话都会被重新封装为
+  Ogg、保存在磁盘上，并通过 SSE 通知：
+
+  ```
+  event: utterance_audio
+  data: {"utterance_id": 4, "session": "20260920101234", "trigger": "device",
+         "url": "/api/clip/utterances/20260920101234/4/audio",
+         "bytes": 41216, "content_type": "audio/ogg"}
+  ```
+
+  太短而不保留的 utterance 会收到 `{"skipped": "too short"}`，且没有 `url`。
+
+按事件里给出的 URL 取音频：
+
+```bash
+curl -o utterance.ogg http://127.0.0.1:5000/api/clip/utterances/20260920101234/4/audio
+curl -o session.ogg   http://127.0.0.1:5000/api/clip/sessions/20260920101234/audio
+```
+
+`GET /api/clip/sessions/<id>/audio` 在文件不存在后返回 404，应理解为「已保留或已清理」，
+而不是错误状态。
+
+运维注意：
+
+- agent 路径会在转写后删除会话音频；网关模式**保留所有文件**。`CLIP_TEMP_DIR`
+  （默认 `clip_audio/`）会持续增长——请按自己的节奏规划磁盘或定期清理。
+- §4 的 systemd unit 无需改动，在 `ExecStart` 末尾追加 `--no-agent` 即可。
+- `--no-agent` 不能与 `--no-clip` 同时使用（那样什么都不提供），也不能与
+  `--input-mode browser` 同时使用（浏览器语音依赖 agent）。
+- `GET /api/clip/status` 会返回 `"agent_enabled": false`，`respeaker-clip status`
+  会打印 `agent mode : off (device gateway)`——用它确认部署跑在正确的模式下。
+
+验证：
+
+```bash
+respeaker-clip status --base-url http://127.0.0.1:5000 | grep 'agent mode'
+curl -s http://127.0.0.1:5000/ | jq .reason          # "agent disabled: device gateway"
+```
+
+## 12. Docker（草案，未在仓库内验证）
 
 难点在 BLE：容器需要宿主机的 D-Bus socket 和蓝牙访问权限，通常意味着 `--network host`、挂载 `/var/run/dbus/system_bus_socket`，并授予适配器访问权。再挂一个卷作为工作目录（`.env`、`chat.db`、`clip_audio/`），并用 `--source` 指向只读挂载的 checkout。鉴于与宿主机蓝牙的强耦合，用 systemd 直接在宿主机跑 CLI（§4）是更好的默认选择；只有当你已有成熟的宿主机蓝牙容器方案时再考虑容器化。
