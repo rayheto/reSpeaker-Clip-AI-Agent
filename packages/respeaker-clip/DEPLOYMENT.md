@@ -3,6 +3,8 @@
 How to run the reSpeaker Clip service as a long-lived process on a host with
 Bluetooth — the thing `npx respeaker-clip serve` wraps.
 
+[中文](./DEPLOYMENT.zh-cn.md)
+
 **What actually runs:** a Flask process holding **one** BLE connection to one
 Clip plus one `/api/clip` HTTP API (REST + SSE). The Node CLI is only the
 installer/launcher: it creates a virtualenv, installs the Python service into

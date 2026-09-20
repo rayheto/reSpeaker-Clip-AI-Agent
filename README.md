@@ -441,7 +441,8 @@ npx respeaker-clip status --base-url http://localhost:5000
   (or `--env-file`), and real environment variables take precedence.
 - **Deployment guide** — systemd unit, BLE/D-Bus permissions, nginx for the SSE
   stream, security notes (the API has no auth and CORS is open), upgrades and a
-  troubleshooting table: [`packages/respeaker-clip/DEPLOYMENT.md`](packages/respeaker-clip/DEPLOYMENT.md).
+  troubleshooting table: [`packages/respeaker-clip/DEPLOYMENT.md`](packages/respeaker-clip/DEPLOYMENT.md)
+  (中文版：[`DEPLOYMENT.zh-cn.md`](packages/respeaker-clip/DEPLOYMENT.zh-cn.md)).
 
 The Python side has its own distribution metadata (`pyproject.toml`, console
 script `respeaker-clip-service`, `python -m backend.service_cli`), so the service

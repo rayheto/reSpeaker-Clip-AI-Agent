@@ -337,6 +337,43 @@ backend/
 
 智能体（Groq `gpt-oss-20b` 或任何 `GROQ_AGENT_MODEL`）随后会自主决定何时使用它。
 
+## 打包与分发
+
+Clip 服务以两种可安装形态分发，二者都由同一个 npm 包
+[`packages/respeaker-clip`](packages/respeaker-clip)（`respeaker-clip`）驱动：
+
+```bash
+npm install respeaker-clip                        # 带类型的客户端 SDK
+npx respeaker-clip serve --source .                # 建 venv、安装并运行本服务
+npx respeaker-clip doctor                          # 检查 node / python / venv / bluez
+npx respeaker-clip status --base-url http://localhost:5000
+```
+
+- **客户端 SDK** — 零依赖 TypeScript：`ClipClient`（REST + 带 `Last-Event-ID`
+  重连的 SSE）与 `RtcSessionController`（把 `rtc_state`、`transcript`、
+  `thinking`、`token`、`result` 折叠成一个可直接渲染的 utterance 状态机）。
+  浏览器与 Node ≥ 18.17 均可用；`npm test` 运行其 `node:test` 测试套件。
+- **服务启动器** — Clip 服务本体是 Python。CLI 解析服务来源（`--source`，或
+  `respeaker-clip-service` pip 包），创建独立虚拟环境、安装，然后启动
+  `python -m backend.service_cli`，并转发 `--host/--port/--input-mode` 及其余环境。
+  它读取所在目录的 `.env`（或用 `--env-file` 指定），真实环境变量优先。
+- **部署文档** — systemd unit、BLE/D-Bus 权限、SSE 的 nginx 配置、安全说明
+  （API 无鉴权且 CORS 全开）、升级与故障排查表：
+  [`packages/respeaker-clip/DEPLOYMENT.zh-cn.md`](packages/respeaker-clip/DEPLOYMENT.zh-cn.md)
+  （English：[`DEPLOYMENT.md`](packages/respeaker-clip/DEPLOYMENT.md)）。
+
+Python 侧有独立的发行元数据（`pyproject.toml`、控制台脚本
+`respeaker-clip-service`、`python -m backend.service_cli`），因此不用 Node 也能
+安装并运行本服务：
+
+```bash
+pip install "respeaker-clip-service[clip] @ git+https://github.com/KasunThushara/reSpeaker-Clip-AI-Agent.git"
+respeaker-clip-service --port 5000 --input-mode clip
+```
+
+从 pip 安装运行时（而非 checkout）只提供 HTTP API——`frontend/` 中的内置 Web
+界面不包含在 wheel 里，此时 `/` 返回可用端点的 JSON 索引。
+
 ## reSpeaker Clip 集成指南
 
 **BLE 前置条件（Linux）：** 安装 BlueZ（`sudo apt install bluez bluetooth`），确保适配器已启用（`bluetoothctl power on`），并确认 Clip 可见/可配对。若 Clip 首次开机，必要时长按进入 BLE 配对。

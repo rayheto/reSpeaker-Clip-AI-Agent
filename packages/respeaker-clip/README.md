@@ -148,7 +148,8 @@ variables already in the environment always take precedence, so systemd
 service answers but the device is offline, and `1` on transport errors.
 
 Deploying it as a service (systemd unit, BLE permissions, reverse proxy for SSE,
-troubleshooting) is covered in **[DEPLOYMENT.md](./DEPLOYMENT.md)**.
+troubleshooting) is covered in **[DEPLOYMENT.md](./DEPLOYMENT.md)** —
+中文版见 **[DEPLOYMENT.zh-cn.md](./DEPLOYMENT.zh-cn.md)**.
 
 ### Prerequisites for BLE voice input
 
