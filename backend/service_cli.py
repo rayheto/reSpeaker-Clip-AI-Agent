@@ -59,6 +59,14 @@ def build_parser() -> argparse.ArgumentParser:
         help="BLE name to scan for when no address is pinned.",
     )
     parser.add_argument(
+        "--env-file",
+        default=None,
+        help=(
+            "Load configuration from this .env file. Defaults to ./.env when it "
+            "exists; real environment variables always win."
+        ),
+    )
+    parser.add_argument(
         "--no-clip",
         action="store_true",
         help="Serve the HTTP API without starting the BLE runtime.",
@@ -108,6 +116,31 @@ def apply_environment(args: argparse.Namespace) -> dict[str, str]:
     return resolved
 
 
+def load_environment_file(args: argparse.Namespace) -> str | None:
+    """Load a ``.env`` file before anything imports :mod:`config`.
+
+    ``config.py`` calls ``load_dotenv()``, which searches upwards from *its own*
+    directory — in a pip install that is site-packages, so a project-local
+    ``.env`` would be missed. Loading the working directory's ``.env`` here (or
+    ``--env-file``) makes both install modes behave the same. Existing
+    environment variables are never overwritten, so systemd ``EnvironmentFile``
+    and container env still take precedence.
+    """
+    from dotenv import load_dotenv
+
+    explicit = args.env_file or os.getenv("RESPEAKER_CLIP_ENV_FILE")
+    if explicit:
+        path = os.path.abspath(explicit)
+        if not os.path.isfile(path):
+            raise SystemExit(f"env file not found: {path}")
+    else:
+        path = os.path.join(os.getcwd(), ".env")
+        if not os.path.isfile(path):
+            return None
+    load_dotenv(path, override=False)
+    return path
+
+
 def resolved_config(args: argparse.Namespace) -> dict[str, object]:
     mode = args.input_mode or os.getenv("VOICE_INPUT_MODE") or DEFAULT_INPUT_MODE
     return {
@@ -123,8 +156,14 @@ def resolved_config(args: argparse.Namespace) -> dict[str, object]:
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
 
+    # Both must happen before anything imports config.py, which snapshots the
+    # environment at import time.
+    env_file = load_environment_file(args)
+
     if args.print_config:
-        print(json.dumps(resolved_config(args), indent=2))
+        config = resolved_config(args)
+        config["env_file"] = env_file
+        print(json.dumps(config, indent=2))
         return 0
 
     apply_environment(args)
@@ -136,11 +175,12 @@ def main(argv: list[str] | None = None) -> int:
     resolved = resolved_config(args)
     app = create_app(clip_enabled=bool(resolved["clip_enabled"]))
     logger.info(
-        "Clip service listening on %s:%s (input_mode=%s, clip_enabled=%s)",
+        "Clip service listening on %s:%s (input_mode=%s, clip_enabled=%s, env_file=%s)",
         resolved["host"],
         resolved["port"],
         resolved["input_mode"],
         resolved["clip_enabled"],
+        env_file or "-",
     )
     app.run(
         host=str(resolved["host"]),

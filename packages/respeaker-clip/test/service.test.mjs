@@ -93,6 +93,17 @@ test('serviceArgs maps options to service flags', () => {
   ]);
 });
 
+test('serviceArgs forwards the env file', () => {
+  assert.deepEqual(serviceArgs({ envFile: '/etc/respeaker-clip.env' }), [
+    '--host',
+    '0.0.0.0',
+    '--port',
+    '5000',
+    '--env-file',
+    '/etc/respeaker-clip.env',
+  ]);
+});
+
 test('venvPythonPath follows the platform layout', () => {
   assert.equal(venvPythonPath('/v', 'linux'), '/v/bin/python');
   assert.equal(venvPythonPath('C:\\v', 'win32'), 'C:\\v\\Scripts\\python.exe');

@@ -42,6 +42,7 @@ serve options:
   --ble-address <addr>    Pin the Clip by BLE address
   --ble-name <name>       Scan for this BLE name instead
   --no-clip               Serve the HTTP API without the BLE runtime
+  --env-file <path>       .env to load (default: ./.env in the working directory)
   --dry-run               Print the resolved plan and exit
   --json                  Machine-readable output
   -- <args...>            Extra arguments forwarded to the service
@@ -81,6 +82,7 @@ function parseCommandLine(argv: string[]) {
       'ble-address': { type: 'string' },
       'ble-name': { type: 'string' },
       'no-clip': { type: 'boolean' },
+      'env-file': { type: 'string' },
       source: { type: 'string' },
       venv: { type: 'string' },
       'pip-spec': { type: 'string' },
@@ -112,6 +114,7 @@ function toServiceOptions(parsed: ParsedArgs): ServiceOptions {
   if (values['ble-address']) options.bleAddress = values['ble-address'];
   if (values['ble-name']) options.bleName = values['ble-name'];
   if (values['no-clip']) options.noClip = true;
+  if (values['env-file']) options.envFile = values['env-file'];
   if (values.source) options.source = values.source;
   if (values.venv) options.venv = values.venv;
   if (values['pip-spec']) options.pipSpec = values['pip-spec'];

@@ -83,6 +83,16 @@ test('serve forwards extra arguments after --', async () => {
   assert.deepEqual(plan.run.args.slice(-4), ['--input-mode', 'both', '--extra-flag', 'value']);
 });
 
+test('serve forwards the env file to the service', async () => {
+  const { io, out } = collect();
+  assert.equal(
+    await main(['serve', '--dry-run', '--json', '--env-file', '/etc/clip.env'], io),
+    0,
+  );
+  const plan = JSON.parse(out.join('\n'));
+  assert.deepEqual(plan.run.args.slice(-2), ['--env-file', '/etc/clip.env']);
+});
+
 test('serve rejects an invalid port', async () => {
   const { io, err } = collect();
   assert.equal(await main(['serve', '--port', 'abc'], io), 1);

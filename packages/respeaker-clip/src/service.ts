@@ -34,6 +34,11 @@ export interface ServiceOptions {
   bleName?: string;
   /** Run the HTTP API without the BLE runtime (browser voice only). */
   noClip?: boolean;
+  /**
+   * `.env` file the service should load. Defaults to `./.env` in the service
+   * working directory; real environment variables always take precedence.
+   */
+  envFile?: string;
   /** Local checkout to run from. Defaults to `RESPEAKER_CLIP_SERVICE_ROOT`. */
   source?: string;
   /** Virtualenv directory. Defaults to `$RESPEAKER_CLIP_HOME/venv`. */
@@ -100,6 +105,7 @@ export function serviceArgs(options: ServiceOptions = {}): string[] {
   if (options.bleAddress) args.push('--ble-address', options.bleAddress);
   if (options.bleName) args.push('--ble-name', options.bleName);
   if (options.noClip) args.push('--no-clip');
+  if (options.envFile) args.push('--env-file', options.envFile);
   if (options.extraArgs?.length) args.push(...options.extraArgs);
   return args;
 }

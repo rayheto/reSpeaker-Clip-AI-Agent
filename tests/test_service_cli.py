@@ -89,3 +89,39 @@ def test_print_config_does_not_start_the_service(capsys, monkeypatch):
     payload = json.loads(capsys.readouterr().out)
     assert payload["port"] == 5999
     assert payload["clip_enabled"] is True
+
+
+def test_dot_env_in_the_working_directory_is_loaded(tmp_path, monkeypatch):
+    """A pip install must honour ./.env, not just a checkout's .env."""
+    monkeypatch.chdir(tmp_path)
+    # delitem records the current value, so teardown removes what dotenv sets.
+    monkeypatch.delitem(service_cli.os.environ, "GROQ_RTC_FINAL_MODEL", raising=False)
+    (tmp_path / ".env").write_text("GROQ_RTC_FINAL_MODEL=whisper-large-v3\n")
+
+    assert service_cli.main(["--print-config"]) == 0
+    assert service_cli.os.environ["GROQ_RTC_FINAL_MODEL"] == "whisper-large-v3"
+
+
+def test_real_environment_wins_over_the_env_file(tmp_path, monkeypatch):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("TTS_VOICE", "from-systemd")
+    (tmp_path / ".env").write_text("TTS_VOICE=from-file\n")
+
+    service_cli.main(["--print-config"])
+    assert service_cli.os.environ["TTS_VOICE"] == "from-systemd"
+
+
+def test_explicit_env_file_is_honoured(tmp_path, monkeypatch, capsys):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.delitem(service_cli.os.environ, "CLIP_BLE_NAME", raising=False)
+    env_file = tmp_path / "clip.env"
+    env_file.write_text("CLIP_BLE_NAME=DeskClip\n")
+
+    assert service_cli.main(["--print-config", "--env-file", str(env_file)]) == 0
+    assert service_cli.os.environ["CLIP_BLE_NAME"] == "DeskClip"
+    assert json.loads(capsys.readouterr().out)["env_file"] == str(env_file)
+
+
+def test_a_missing_explicit_env_file_fails_fast():
+    with pytest.raises(SystemExit):
+        service_cli.main(["--print-config", "--env-file", "/nope/.env"])
