@@ -343,11 +343,22 @@ stable ordering); prompt tests verify the hybrid routing and safety wording.
 ```
 app.py                       # Flask factory + dev server
 config.py                    # Settings from .env
+pyproject.toml               # Python distribution (console script respeaker-clip-service)
 supabase_schema.sql          # Supabase table schema (run in SQL Editor)
+packages/
+  respeaker-clip/            # npm package: TS client SDK + Python service runner CLI
 frontend/
   templates/index.html       # UI (mic + text chat)
   static/js/app.js           # MediaRecorder + SSE consumer
 backend/
+  service_cli.py             # `python -m backend.service_cli` (used by the npm CLI)
+  clip/
+    runtime.py               # BLE runtime: connection supervisor, RTC warm-pause utterances
+    worker.py                # asyncio daemon-thread façade for Flask
+    store.py                 # clip_ingestions persistence (SQLite/Supabase)
+    transfer.py              # Ogg packet download + streaming receiver
+    ogg.py                   # Raw Opus → Ogg Opus re-container (file and in-memory)
+    exceptions.py            # Clip error hierarchy mapped to HTTP statuses
   llm/
     client.py                # Groq LLM clients (llm, agent_llm)
     embeddings.py            # Local sentence-transformers embedding
@@ -382,6 +393,7 @@ backend/
   routes/
     chat.py                  # /api/chat + /api/chat/stream (SSE)
     voice.py                 # /api/voice
+    clip.py                  # /api/clip/* (status, events, recordings, stream, ingest)
     composio.py              # /api/composio/* toolkit selection + auth status
     google_auth.py           # Legacy direct Google OAuth module (not registered)
     tts.py                   # /api/tts
@@ -403,6 +415,42 @@ backend/
 3. (Optional) Mention it in the agent system prompt in `backend/graph/nodes/agentic.py`.
 
 The agent (Groq `gpt-oss-20b` or whichever `GROQ_AGENT_MODEL`) then decides autonomously when to use it.
+
+## Packaging & distribution
+
+The Clip service ships in two installable forms, both driven from one npm
+package, [`packages/respeaker-clip`](packages/respeaker-clip) (`respeaker-clip`):
+
+```bash
+npm install respeaker-clip                        # typed client SDK
+npx respeaker-clip serve --source .                # create a venv, install, run this service
+npx respeaker-clip doctor                          # node / python / venv / bluez checks
+npx respeaker-clip status --base-url http://localhost:5000
+```
+
+- **Client SDK** — zero-dependency TypeScript: `ClipClient` (REST + SSE with
+  `Last-Event-ID` reconnect) and `RtcSessionController` (folds `rtc_state`,
+  `transcript`, `thinking`, `token` and `result` into one renderable utterance
+  state machine). Works in the browser and in Node ≥ 18.17. `npm test` runs its
+  `node:test` suite.
+- **Service runner** — the Clip service itself is Python. The CLI resolves a
+  service source (`--source`, or the `respeaker-clip-service` pip distribution),
+  creates a dedicated virtualenv, installs into it, and launches
+  `python -m backend.service_cli`, forwarding `--host/--port/--input-mode` and
+  the rest of the environment.
+
+The Python side has its own distribution metadata (`pyproject.toml`, console
+script `respeaker-clip-service`, `python -m backend.service_cli`), so the service
+can also be installed and run without Node:
+
+```bash
+pip install "respeaker-clip-service[clip] @ git+https://github.com/KasunThushara/reSpeaker-Clip-AI-Agent.git"
+respeaker-clip-service --port 5000 --input-mode clip
+```
+
+Running from a pip install (rather than a checkout) serves the HTTP API only —
+the bundled web UI in `frontend/` is not part of the wheel, and `/` then returns
+a JSON index of the available endpoints.
 
 ## reSpeaker Clip integration guide
 

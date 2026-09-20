@@ -1,0 +1,69 @@
+{
+  "name": "respeaker-clip",
+  "version": "0.1.0",
+  "description": "Client SDK and service runner for the reSpeaker Clip voice service (BLE runtime, RTC live streaming, /api/clip HTTP API).",
+  "keywords": [
+    "respeaker",
+    "clip",
+    "seeed",
+    "ble",
+    "voice",
+    "stt",
+    "rtc",
+    "sse"
+  ],
+  "license": "UNLICENSED",
+  "author": "Seeed Studio",
+  "type": "module",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "main": "./dist/cjs/index.js",
+  "module": "./dist/esm/index.js",
+  "types": "./dist/esm/index.d.ts",
+  "exports": {
+    ".": {
+      "import": {
+        "types": "./dist/esm/index.d.ts",
+        "default": "./dist/esm/index.js"
+      },
+      "require": {
+        "types": "./dist/cjs/index.d.ts",
+        "default": "./dist/cjs/index.js"
+      }
+    },
+    "./service": {
+      "import": {
+        "types": "./dist/esm/service.d.ts",
+        "default": "./dist/esm/service.js"
+      },
+      "require": {
+        "types": "./dist/cjs/service.d.ts",
+        "default": "./dist/cjs/service.js"
+      }
+    },
+    "./package.json": "./package.json"
+  },
+  "bin": {
+    "respeaker-clip": "bin/respeaker-clip.mjs"
+  },
+  "files": [
+    "bin",
+    "dist",
+    "README.md"
+  ],
+  "scripts": {
+    "build": "node scripts/build.mjs",
+    "typecheck": "tsc -p tsconfig.esm.json --noEmit",
+    "test": "npm run build && node --test test/",
+    "prepare": "npm run build",
+    "prepublishOnly": "npm test"
+  },
+  "devDependencies": {
+    "@types/node": "^18.19.50",
+    "typescript": "^5.6.3"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

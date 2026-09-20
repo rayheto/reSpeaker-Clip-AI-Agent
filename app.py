@@ -1,8 +1,9 @@
 import atexit
 import logging
 
-from flask import Flask, render_template, send_from_directory
+from flask import Flask, jsonify, render_template, send_from_directory
 from flask_cors import CORS
+from jinja2 import TemplateNotFound
 from backend.routes import register_routes
 from backend.database import init_db
 from backend.clip.store import init_clip_ingestions
@@ -50,14 +51,37 @@ def create_app(clip_enabled: bool | None = None, clip_factory=None) -> Flask:
 
     @app.route("/")
     def index():
-        return render_template(
-            "index.html",
-            clip_config={
-                "input_mode": settings.VOICE_INPUT_MODE,
-                "clip_enabled": app.extensions.get("clip_worker") is not None,
-                "record_mode": settings.CLIP_RECORD_MODE,
-            },
-        )
+        try:
+            return render_template(
+                "index.html",
+                clip_config={
+                    "input_mode": settings.VOICE_INPUT_MODE,
+                    "clip_enabled": app.extensions.get("clip_worker") is not None,
+                    "record_mode": settings.CLIP_RECORD_MODE,
+                },
+            )
+        except TemplateNotFound:
+            # Installed as a package the bundled web UI is absent; the service
+            # is then API-only (the npm SDK, or any HTTP client, drives it).
+            return (
+                jsonify(
+                    {
+                        "service": "reSpeaker Clip",
+                        "web_ui": False,
+                        "endpoints": [
+                            "/api/clip/status",
+                            "/api/clip/events",
+                            "/api/clip/recordings/start",
+                            "/api/clip/recordings/stop",
+                            "/api/clip/stream/resume",
+                            "/api/clip/stream/pause",
+                            "/api/clip/sessions/<session_id>/ingest",
+                            "/api/clip/context",
+                        ],
+                    }
+                ),
+                200,
+            )
 
     @app.route("/static/<path:filename>")
     def static_files(filename):

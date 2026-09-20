@@ -17,3 +17,6 @@ token.json
 .composio_toolkits.json
 # Clip temp audio (downloaded sessions / re-container Ogg files)
 clip_audio/
+
+# npm package workspace (packages/respeaker-clip)
+node_modules/

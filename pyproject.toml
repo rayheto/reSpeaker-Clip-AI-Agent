@@ -1,0 +1,63 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "respeaker-clip-service"
+version = "0.1.0"
+description = "reSpeaker Clip voice service: BLE runtime, RTC live streaming and the /api/clip HTTP API"
+readme = "README.md"
+requires-python = ">=3.10"
+keywords = ["respeaker", "clip", "seeed", "ble", "voice", "stt", "rtc", "flask"]
+classifiers = [
+    "Private :: Do Not Upload",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Multimedia :: Sound/Audio :: Speech",
+]
+# Runtime set: the same versions as requirements.txt, minus pytest and minus the
+# BLE SDK. The SDK is a direct git reference (it has no PyPI release), and PyPI
+# rejects direct references — that is why it lives in the optional extra below
+# and why the `clip` extra workaround is documented in the README.
+dependencies = [
+    "Flask==3.0.3",
+    "flask-cors==6.0.5",
+    "httpx==0.28.1",
+    "groq==0.37.1",
+    "langgraph==1.2.11",
+    "langgraph-checkpoint==4.2.0",
+    "langgraph-prebuilt==1.1.0",
+    "langgraph-sdk==0.4.2",
+    "python-dotenv==1.0.1",
+    "tavily-python==0.7.27",
+    "mem0ai==2.0.18",
+    "sentence-transformers==6.0.0",
+    "pinecone==9.1.0",
+    "supabase==2.31.0",
+    "google-api-python-client==2.199.0",
+    "google-auth-httplib2==0.4.2",
+    "google-auth-oauthlib==1.4.1",
+    "pysocks==1.7.1",
+    "composio==0.21.0",
+    "composio_langgraph==0.21.0",
+]
+
+[project.optional-dependencies]
+# BLE + RTC streaming SDK. Direct git reference: resolves with pip today, but a
+# distribution carrying it cannot be uploaded to PyPI (documented in README).
+clip = [
+    "respeaker-clip-sdk[ble] @ git+https://github.com/rayheto/reSpeaker_Clip.git@a146061b3820473f119dfaa7e8ac6791a48b9edb#subdirectory=sdk",
+]
+dev = ["pytest==8.3.2"]
+
+[project.scripts]
+respeaker-clip-service = "backend.service_cli:main"
+
+[tool.setuptools]
+# Both live at the repository root, outside any package.
+py-modules = ["app", "config"]
+
+[tool.setuptools.packages.find]
+include = ["backend*"]
