@@ -23,7 +23,7 @@ import pytest
 from config import settings
 from backend.clip import store
 from backend.clip.audio_paths import session_audio_path, session_dir, utterance_audio_path
-from backend.clip.runtime import ClipRuntime, IngestRequest
+from backend.clip.runtime import RTC_PHASE_CAPTURING, ClipRuntime, IngestRequest
 from tests.test_clip_ogg import packet
 from tests.test_clip_runtime import FakeTransport
 
@@ -42,6 +42,8 @@ def clip_db(monkeypatch, tmp_path):
     monkeypatch.setattr(settings, "SUPABASE_KEY", "")
     monkeypatch.setattr(settings, "DATABASE_URL", f"sqlite:///{tmp_path}/gateway.db")
     monkeypatch.setattr(settings, "CLIP_TEMP_DIR", str(tmp_path / "clip_audio"))
+    # Deterministic capture transitions (see test_clip_rtc).
+    monkeypatch.setattr(settings, "RTC_SETTLE_SECONDS", 0.0)
     store.init_clip_ingestions()
 
 
@@ -58,11 +60,11 @@ class FakeWorker:
         return None
 
 
-def make_gateway_runtime(transport=None, **kwargs):
+def make_gateway_runtime(transport=None, *, rtc_auto_arm: bool = False, **kwargs):
     return ClipRuntime(
         transport=transport or FakeTransport(),
         device_id="Clip",
-        rtc_auto_arm=False,
+        rtc_auto_arm=rtc_auto_arm,
         agent_enabled=False,
         **kwargs,
     )
@@ -210,6 +212,63 @@ def test_gateway_status_reports_the_mode():
 # ---------------------------------------------------------------------------
 # RTC utterances become audio, not transcripts
 # ---------------------------------------------------------------------------
+
+def test_capturing_never_runs_partial_stt():
+    """The rolling partial STT loop is agent-only: it must not even start.
+
+    Regression guard: it used to be launched for every utterance regardless of
+    the mode, which called Groq Whisper and imported backend.llm.stt lazily —
+    breaking both "no STT" and "no agent module is loaded" in gateway mode.
+    """
+    async def body():
+        transport = FakeTransport()
+        runtime = make_gateway_runtime(transport, rtc_auto_arm=True)
+        calls = []
+
+        def partial(frames):
+            calls.append(len(frames))
+            raise AssertionError("gateway mode must not transcribe")
+
+        runtime.rtc_stt_partial = partial
+
+        await runtime._connect()
+        await runtime._on_connected()
+        await runtime.rtc_resume()
+        for _ in range(5):
+            transport.emit_stream_data(OPUS_FRAME)
+
+        assert runtime._rtc_phase == RTC_PHASE_CAPTURING
+        assert runtime._rtc_capture_task is None
+
+        # Even a direct call must return without touching the STT hook.
+        await runtime._rtc_capture_worker(runtime._rtc_utterance_id or 1)
+
+        assert calls == []
+        assert not [event for event in runtime.event_history() if event["type"] == "transcript"]
+
+    run(body())
+
+
+def test_agent_mode_still_launches_the_partial_loop():
+    """The inverse guard: the mode flag must not disable the agent loop."""
+    async def body():
+        transport = FakeTransport()
+        runtime = ClipRuntime(
+            transport=transport, device_id="Clip", rtc_auto_arm=True, agent_enabled=True
+        )
+
+        await runtime._connect()
+        await runtime._on_connected()
+        await runtime.rtc_resume()
+        for _ in range(5):
+            transport.emit_stream_data(OPUS_FRAME)
+
+        assert runtime._rtc_phase == RTC_PHASE_CAPTURING
+        assert runtime._rtc_capture_task is not None
+        await runtime.shutdown()
+
+    run(body())
+
 
 def test_utterance_is_written_and_announced_as_audio():
     async def body():

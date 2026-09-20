@@ -979,12 +979,21 @@ class ClipRuntime:
         if self._rtc_capture_task is not None and not self._rtc_capture_task.done():
             self._rtc_capture_task.cancel()
             self._rtc_capture_task.add_done_callback(_swallow_task_result)
-        self._rtc_capture_task = asyncio.create_task(
-            self._rtc_capture_worker(uid), name=f"clip-rtc-capture-{uid}"
-        )
+        if self.agent_enabled:
+            self._rtc_capture_task = asyncio.create_task(
+                self._rtc_capture_worker(uid), name=f"clip-rtc-capture-{uid}"
+            )
+        else:
+            self._rtc_capture_task = None
 
     async def _rtc_capture_worker(self, uid: int) -> None:
-        """Rolling partial STT: latest-wins, at most one request in flight."""
+        """Rolling partial STT: latest-wins, at most one request in flight.
+
+        Agent-only: a device gateway does no STT at all, so this never starts
+        (the guard also covers a direct call).
+        """
+        if not self.agent_enabled:
+            return
         interval = max(0.2, float(settings.RTC_PARTIAL_INTERVAL))
         while not self._stopping.is_set():
             if (
