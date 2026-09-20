@@ -28,6 +28,12 @@ class FakeClipWorker:
             "last_error": None,
             "battery_percent": 90,
             "state": "IDLE",
+            "rtc_phase": "paused",
+            "rtc_session": "20269900000001",
+            "rtc_utterance_id": 3,
+            "rtc_partial_transcript": "hello",
+            "rtc_processing": False,
+            "rtc_error": None,
         }
         self.events: list[dict] = []
         self.start_calls: list[tuple] = []
@@ -38,6 +44,10 @@ class FakeClipWorker:
         self.stop_error: Exception | None = None
         self.status_error: Exception | None = None
         self.ingest_error: Exception | None = None
+        self.rtc_resume_calls = 0
+        self.rtc_pause_calls = 0
+        self.rtc_resume_error: Exception | None = None
+        self.rtc_pause_error: Exception | None = None
 
     def get_status(self):
         if self.status_error:
@@ -55,6 +65,28 @@ class FakeClipWorker:
         if self.stop_error:
             raise self.stop_error
         return {"accepted": True, "session": "20260821000010"}
+
+    def rtc_resume(self):
+        self.rtc_resume_calls += 1
+        if self.rtc_resume_error:
+            raise self.rtc_resume_error
+        return {
+            "accepted": True,
+            "phase": "capturing",
+            "session": "20269900000001",
+            "utterance_id": self.status_payload["rtc_utterance_id"] + 1,
+        }
+
+    def rtc_pause(self):
+        self.rtc_pause_calls += 1
+        if self.rtc_pause_error:
+            raise self.rtc_pause_error
+        return {
+            "accepted": True,
+            "phase": "paused",
+            "session": "20269900000001",
+            "utterance_id": self.status_payload["rtc_utterance_id"],
+        }
 
     def ingest(self, session_id, trigger="manual"):
         self.ingest_calls.append((session_id, trigger))
@@ -221,6 +253,74 @@ def test_ingest_registers_requested_conversation(api):
     assert fake.ingest_calls == [("20260821000022", "retry")]
 
 
+# -- RTC stream control ------------------------------------------------------
+
+def test_stream_resume_ok(api):
+    client, fake = api
+    r = client.post("/api/clip/stream/resume", json={})
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data["accepted"] is True
+    assert data["phase"] == "capturing"
+    assert fake.rtc_resume_calls == 1
+
+
+def test_stream_pause_ok(api):
+    client, fake = api
+    r = client.post("/api/clip/stream/pause", json={})
+    assert r.status_code == 202
+    data = r.get_json()
+    assert data["accepted"] is True
+    assert data["phase"] == "paused"
+    assert fake.rtc_pause_calls == 1
+
+
+def test_stream_resume_conflict_409(api):
+    client, fake = api
+    fake.rtc_resume_error = ClipConflictError("RTC live stream is not armed")
+    r = client.post("/api/clip/stream/resume", json={})
+    assert r.status_code == 409
+
+
+def test_stream_pause_conflict_409(api):
+    client, fake = api
+    fake.rtc_pause_error = ClipConflictError("RTC live stream is not armed")
+    r = client.post("/api/clip/stream/pause", json={})
+    assert r.status_code == 409
+
+
+def test_stream_resume_unavailable_503(api):
+    client, fake = api
+    fake.rtc_resume_error = ClipUnavailableError("reconnecting")
+    r = client.post("/api/clip/stream/resume", json={})
+    assert r.status_code == 503
+
+
+def test_stream_resume_command_failed_502(api):
+    client, fake = api
+    fake.rtc_resume_error = ClipCommandFailedError("AT+RESUME rejected")
+    r = client.post("/api/clip/stream/resume", json={})
+    assert r.status_code == 502
+
+
+def test_stream_endpoints_disabled_503(disabled_api):
+    client = disabled_api
+    assert client.post("/api/clip/stream/resume", json={}).status_code == 503
+    assert client.post("/api/clip/stream/pause", json={}).status_code == 503
+
+
+def test_status_includes_rtc_fields(api):
+    client, _ = api
+    r = client.get("/api/clip/status")
+    assert r.status_code == 200
+    data = r.get_json()
+    assert data["rtc_phase"] == "paused"
+    assert data["rtc_session"] == "20269900000001"
+    assert data["rtc_utterance_id"] == 3
+    assert data["rtc_partial_transcript"] == "hello"
+    assert data["rtc_processing"] is False
+
+
 # -- SSE ---------------------------------------------------------------------
 
 def test_events_stream_replays_history(api):
@@ -244,6 +344,31 @@ def test_events_stream_replays_history(api):
         assert "event: result" in text
         assert "hello" in text
         assert 'event: {"type":' not in text  # SSE data is JSON, event names bare
+    finally:
+        resp.close()
+
+
+def test_events_stream_rtc_events(api):
+    client, fake = api
+    fake.events = [
+        {"type": "connection", "connected": True, "error": None},
+        {"type": "rtc_state", "phase": "capturing", "session": "20269900000001", "utterance_id": 1},
+        {"type": "transcript", "utterance_id": 1, "text": "hello clip", "final": False},
+        {"type": "transcript", "utterance_id": 1, "text": "hello clip", "final": True},
+    ]
+    resp = client.get("/api/clip/events", buffered=False)
+    stream = resp.response
+    text = ""
+    try:
+        for _ in range(100):
+            chunk = next(stream)
+            text += chunk.decode("utf-8", "replace")
+            if "event: transcript" in text and '"final": true' in text:
+                break
+        assert "event: rtc_state" in text
+        assert "event: transcript" in text
+        assert '"phase": "capturing"' in text
+        assert '"utterance_id": 1' in text
     finally:
         resp.close()
 

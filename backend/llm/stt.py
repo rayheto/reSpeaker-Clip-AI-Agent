@@ -60,23 +60,36 @@ def _apply_corrections(text: str) -> str:
     return _fuzzy_correct(corrected)
 
 
-def transcribe_bytes(audio_bytes: bytes, filename: str = "audio.wav") -> str:
+def transcribe_bytes(
+    audio_bytes: bytes,
+    filename: str = "audio.wav",
+    *,
+    model: str | None = None,
+    corrections: bool = True,
+) -> str:
+    """Transcribe raw audio bytes with the configured (or explicit) model.
+
+    ``model`` overrides ``GROQ_STT_MODEL`` (the RTC partial/final pipeline
+    uses this); ``corrections=False`` skips post-processing for callers that
+    apply their own corrections.
+    """
     client = get_client()
     transcription = client.audio.transcriptions.create(
         file=(filename, audio_bytes),
-        model=settings.GROQ_STT_MODEL,
+        model=model or settings.GROQ_STT_MODEL,
         temperature=settings.STT_TEMPERATURE,
         response_format="verbose_json",
         prompt=settings.STT_PROMPT or None,
         language=settings.STT_LANGUAGE or None,
     )
-    return _apply_corrections(transcription.text)
+    text = transcription.text
+    return _apply_corrections(text) if corrections else text
 
 
-def transcribe_file(file_path: str) -> str:
+def transcribe_file(file_path: str, *, model: str | None = None) -> str:
     import os
 
     filename = os.path.basename(file_path)
     with open(file_path, "rb") as f:
         audio_bytes = f.read()
-    return transcribe_bytes(audio_bytes, filename)
+    return transcribe_bytes(audio_bytes, filename, model=model)

@@ -31,7 +31,21 @@ let clipStartedByWeb = false;
 let clipDisconnectTimer = null;
 let clipDisconnectError = '';
 
+// RTC warm-pause live streaming state (device double-click + web button)
+let rtcPhase = 'disconnected';   // disconnected|arming|paused|capturing|finalizing|stopped
+let rtcSession = null;
+let rtcUtteranceId = null;
+let rtcProcessing = false;       // a final STT/LLM pass is running for an utterance
+let rtcStreamActive = false;     // a reply is streaming (thinking/token events in flight)
+let rtcAssistantMsg = null;      // live assistant bubble for the streaming RTC reply
+const utteranceBubbles = new Map();   // utterance_id -> provisional user bubble
+const finalTranscripts = new Set();   // utterances whose final text is displayed
+
 const CLIP_OFFLINE_GRACE_MS = 60000;
+
+function pauseTts() {
+    if (audioPlayer && !audioPlayer.paused) audioPlayer.pause();
+}
 
 // ---- config embedded by the server ---------------------------------------
 let CLIP_CONFIG = { input_mode: 'browser', clip_enabled: false, record_mode: 'enhanced' };
@@ -63,12 +77,18 @@ function setClipStatusLine(text, isError) {
     clipStatusLine.className = 'clip-status' + (isError ? ' error' : '');
 }
 
+function clipButtonLabel() {
+    if (rtcPhase === 'capturing') return 'Pause';
+    if (rtcPhase === 'paused') return 'Resume';
+    return clipRecording ? 'Stop' : 'Clip';
+}
+
 function setClipUI(recording, busy, offline) {
     clipRecording = !!recording;
     clipBusy = !!busy;
     clipOffline = offline !== undefined ? !!offline : clipOffline;
-    clipBtn.classList.toggle('recording', clipRecording);
-    clipBtnLabel.textContent = clipRecording ? 'Stop' : 'Clip';
+    clipBtn.classList.toggle('recording', clipRecording || rtcPhase === 'capturing');
+    clipBtnLabel.textContent = clipButtonLabel();
     clipBtn.disabled = clipBusy || clipOffline || !CLIP_AVAILABLE;
 }
 
@@ -353,12 +373,88 @@ function toggleClipRecording(event) {
         setStatus('Clip is offline — check BLE', true);
         return;
     }
+    if (rtcPhase === 'capturing') {
+        clipStreamPause();
+        return;
+    }
+    if (rtcPhase === 'paused' || rtcPhase === 'arming') {
+        clipStreamResume();
+        return;
+    }
     if (clipRecording) {
         // A web press can also stop a recording started from the physical key.
         clipStop();
         return;
     }
     clipStart();
+}
+
+// ---- RTC stream control (warm pause: one utterance per RESUME->PAUSE) -----
+
+function clipStreamResume() {
+    if (clipBusy || clipOffline) return;
+    // Optimistic UI: the next RESUME interval is a new logical utterance.
+    setClipUI(false, true);
+    setStatus('Listening (Clip)...');
+    fetch('/api/clip/stream/resume', { method: 'POST' })
+        .then((resp) => {
+            if (!resp.ok) return resp.json().then((d) => { throw new Error(d.error || 'resume failed'); });
+            return resp.json();
+        })
+        .then(() => {
+            setClipUI(false, false);
+            setStatus('Listening (Clip)...');
+        })
+        .catch((err) => {
+            setClipUI(false, false);
+            setStatus('Clip error: ' + err.message, true);
+            refreshClipStatus();
+        });
+}
+
+function clipStreamPause() {
+    if (clipBusy || clipOffline) return;
+    pauseTts();
+    setClipUI(false, true);
+    setStatus('Finalizing...');
+    fetch('/api/clip/stream/pause', { method: 'POST' })
+        .then((resp) => {
+            if (!resp.ok) return resp.json().then((d) => { throw new Error(d.error || 'pause failed'); });
+            return resp.json();
+        })
+        .then(() => { setClipUI(false, false); })
+        .catch((err) => {
+            // Idempotent: a physical double-click may have paused first.
+            setClipUI(false, false);
+            setStatus('Clip error: ' + err.message, true);
+            refreshClipStatus();
+        });
+}
+
+function renderRtcStatus() {
+    applyClipStateLine();
+    if (rtcStreamActive) return;  // streaming status owned by thinking/token events
+    if (rtcPhase === 'capturing') {
+        setStatus('Listening (Clip)...');
+    } else if (rtcPhase === 'arming') {
+        setStatus('Armed — starting RTC...');
+    } else if (rtcPhase === 'finalizing' || rtcProcessing) {
+        setStatus('Finalizing...');
+    } else if (rtcPhase === 'paused') {
+        setStatus('Armed — press Resume to speak');
+    }
+}
+
+function applyClipStateLine() {
+    const labels = {
+        capturing: 'Listening — Logged utterance ' + (rtcUtteranceId || ''),
+        paused: 'Armed (warm pause) — no BLE audio while paused',
+        arming: 'Armed — starting',
+        finalizing: 'Finalizing utterance ' + (rtcUtteranceId || ''),
+        stopped: 'RTC stopped — click Clip to restart legacy recording',
+    };
+    const label = labels[rtcPhase];
+    if (label && !clipOffline) setClipStatusLine(label);
 }
 
 clipBtn.addEventListener('click', toggleClipRecording);
@@ -372,12 +468,46 @@ function handleClipSseEvent(eventName, data) {
         if (data && data.connected) {
             noteClipConnected('Clip connected' + (data.status && data.status.device_name ? ' — ' + data.status.device_name : ''));
             setClipUI(clipRecording, false, false);
-            // Re-sync recording state after any reconnect.
+            // Re-sync recording/RTC state after any reconnect.
             refreshClipStatus();
         } else {
             noteClipDisconnected(data && data.error);
         }
-    } else if (eventName === 'recording') {
+        return;
+    }
+    if (eventName === 'rtc_state') {
+        handleRtcStateEvent(data);
+        return;
+    }
+    if (eventName === 'transcript') {
+        handleTranscriptEvent(data);
+        return;
+    }
+    if (eventName === 'thinking') {
+        // LLM reply in progress: tool call / generation started.
+        rtcStreamActive = true;
+        rtcProcessing = true;
+        if (data && data.tool) {
+            setStatus('AI is using ' + data.tool + '...');
+        } else {
+            setStatus('Thinking...');
+        }
+        return;
+    }
+    if (eventName === 'token') {
+        rtcStreamActive = true;
+        const text = (data && data.text) || '';
+        if (!text) return;
+        if (!rtcAssistantMsg) {
+            rtcAssistantMsg = document.createElement('div');
+            rtcAssistantMsg.className = 'message assistant streaming';
+            chatBox.appendChild(rtcAssistantMsg);
+        }
+        rtcAssistantMsg.textContent += text;
+        chatBox.scrollTop = chatBox.scrollHeight;
+        return;
+    }
+    if (eventName === 'recording') {
         if (data && data.action === 'started') {
             clipStartedByWeb = data.trigger === 'web';
             setClipUI(true, false);
@@ -395,15 +525,118 @@ function handleClipSseEvent(eventName, data) {
         else if (s === 'processing') { setStatus('Transcribing & thinking...'); setClipStatusLine('Processing ' + data.session); }
         else if (s === 'failed') { setStatus('Processing failed: ' + (data.error || 'unknown'), true); setClipStatusLine('', true); setClipUI(false, false); }
     } else if (eventName === 'result') {
-        if (data.transcript) addMessage('user', data.transcript);
-        if (data.response) addMessage('assistant', data.response);
+        const uid = data.utterance_id != null ? data.utterance_id : null;
+        if (uid !== null) {
+            // The authoritative final transcript was already rendered by the
+            // transcript event: never add the user bubble a second time.
+            if (!finalTranscripts.has(uid)) {
+                if (data.transcript) addMessage('user', data.transcript);
+            }
+            utteranceBubbles.delete(uid);
+            finalTranscripts.delete(uid);
+        } else if (data.transcript) {
+            addMessage('user', data.transcript);
+        }
+        if (rtcAssistantMsg) {
+            // A live streamed assistant bubble already carries the answer —
+            // finalize its text instead of double-adding a second message.
+            if (data.response) rtcAssistantMsg.textContent = data.response;
+            rtcAssistantMsg.classList.remove('streaming');
+            rtcAssistantMsg = null;
+        } else if (data.response) {
+            addMessage('assistant', data.response);
+        }
         rememberConversation(data.conversation_id);
         maybeOfferComposioConnect(data.response, data.transcript);
         if (data.response) playTts(data.response);
+        rtcStreamActive = false;
+        rtcProcessing = false;
         setClipUI(false, false);
         setStatus('Ready');
-        setClipStatusLine('Answered from session ' + data.session + ' (' + (data.trigger || '') + ')');
+        if (uid !== null) {
+            setClipStatusLine('Answered utterance ' + uid + ' (RTC)');
+        } else {
+            setClipStatusLine('Answered from session ' + data.session + ' (' + (data.trigger || '') + ')');
+        }
     }
+}
+
+// ---- RTC event handling ----------------------------------------------------
+
+function handleRtcStateEvent(data) {
+    if (!data || !data.phase) return;
+    const previousPhase = rtcPhase;
+    rtcPhase = data.phase;
+    if (data.session) rtcSession = data.session;
+    if (data.utterance_id != null) {
+        // A new logical utterance starts: stop any pending TTS to reduce
+        // feedback while the user speaks again.
+        if (data.phase === 'capturing' && data.utterance_id !== rtcUtteranceId) {
+            pauseTts();
+        }
+        rtcUtteranceId = data.utterance_id;
+    }
+    if (data.error) {
+        setClipStatusLine('RTC error: ' + data.error, true);
+    }
+    if (data.phase === 'capturing') {
+        rtcProcessing = false;
+    } else if (data.phase === 'finalizing') {
+        // A finalize job is now in flight; mark processing immediately so the
+        // next renderRtcStatus (or a paused event right after) shows
+        // "Finalizing..." instead of the armed prompt.
+        rtcProcessing = true;
+    }
+    renderRtcStatus();
+    setClipUI(clipRecording, clipBusy, clipOffline);
+}
+
+function handleTranscriptEvent(data) {
+    if (!data || data.utterance_id == null) return;
+    const uid = data.utterance_id;
+    if (data.final) {
+        if (data.skipped || !data.text) {
+            // Too short / empty authoritative result: no LLM invocation and
+            // no stale partial text left in the conversation.
+            removeProvisionalBubble(uid);
+            return;
+        }
+        finalTranscripts.add(uid);
+        let bubble = utteranceBubbles.get(uid);
+        if (bubble) {
+            bubble.textContent = data.text;
+            bubble.classList.remove('provisional');
+            bubble.classList.add('final');
+        } else {
+            bubble = addProvisionalBubble(uid, data.text);
+            bubble.classList.remove('provisional');
+            bubble.classList.add('final');
+        }
+        return;
+    }
+    if (!data.text) return;
+    let bubble = utteranceBubbles.get(uid);
+    if (bubble) {
+        bubble.textContent = data.text;
+    } else {
+        addProvisionalBubble(uid, data.text);
+    }
+}
+
+function addProvisionalBubble(uid, text) {
+    const msg = document.createElement('div');
+    msg.className = 'message user provisional';
+    msg.textContent = text;
+    chatBox.appendChild(msg);
+    chatBox.scrollTop = chatBox.scrollHeight;
+    utteranceBubbles.set(uid, msg);
+    return msg;
+}
+
+function removeProvisionalBubble(uid) {
+    const bubble = utteranceBubbles.get(uid);
+    if (bubble) bubble.remove();
+    utteranceBubbles.delete(uid);
 }
 
 function refreshClipStatus() {
@@ -415,6 +648,13 @@ function refreshClipStatus() {
             } else {
                 const suffix = data.transfer_active ? ' — downloading' : '';
                 noteClipConnected('Clip connected — ' + (data.device_name || data.device_id || '') + suffix);
+                if (data.rtc_phase) {
+                    rtcPhase = data.rtc_phase;
+                    if (data.rtc_session) rtcSession = data.rtc_session;
+                    if (data.rtc_utterance_id != null) rtcUtteranceId = data.rtc_utterance_id;
+                    rtcProcessing = !!data.rtc_processing;
+                }
+                renderRtcStatus();
                 // Recording is not busy; only in-flight transfers/requests disable it.
                 setClipUI(!!data.recording, !!data.transfer_active, false);
                 if (data.recording) setClipUI(true, false);
@@ -433,7 +673,7 @@ function openClipEvents() {
         // stay silent and only become visible after the shared grace period.
         noteClipDisconnected('event stream disconnected');
     };
-    ['connection', 'recording', 'workflow', 'result'].forEach((name) => {
+    ['connection', 'recording', 'workflow', 'result', 'rtc_state', 'transcript', 'thinking', 'token'].forEach((name) => {
         es.addEventListener(name, (ev) => {
             let data = {};
             try { data = JSON.parse(ev.data || '{}'); } catch (_) {}

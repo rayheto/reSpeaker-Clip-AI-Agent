@@ -21,4 +21,8 @@ composio==0.21.0
 composio_langgraph==0.21.0
 
 # reSpeaker Clip BLE integration (pinned SDK commit; subdirectory=sdk)
-respeaker-clip-sdk[ble] @ git+https://github.com/Seeed-Studio/reSpeaker_Clip.git@93f86674a280b3325dd37a152d9b80d02857b049#subdirectory=sdk
+# RTC live-streaming SDK (rayheto fork of reSpeaker_Clip at the RTC merge
+# commit a146061b; Seeed-Studio pin 93f8667 lacks clip.stream / start_rtc).
+# Provides: ClipClient.start_rtc(), stream_rtc(), StreamReceiver, and
+# lease-token file-frame handler detach (BaseTransport).
+respeaker-clip-sdk[ble] @ git+https://github.com/rayheto/reSpeaker_Clip.git@a146061b3820473f119dfaa7e8ac6791a48b9edb#subdirectory=sdk

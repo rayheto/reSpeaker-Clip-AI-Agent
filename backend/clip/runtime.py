@@ -23,6 +23,7 @@ import asyncio
 import logging
 import random
 import threading
+import time
 from collections import deque
 from dataclasses import dataclass
 from itertools import count
@@ -30,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable
 
 from clip import BleTransport, ClipClient
+from clip.stream import StreamReceiver
 from clip.exceptions import (
     ClipError,
     CommandError,
@@ -68,7 +70,72 @@ _CONFLICT_HINTS = (
     "no active session",
     "invalid state",
     "cannot delete active session",
+    "already paused",
+    "not paused",
 )
+
+# --- RTC live-stream phases (warm pause: BLE frames flow only while capturing) --
+RTC_PHASE_DISCONNECTED = "disconnected"
+RTC_PHASE_ARMING = "arming"
+RTC_PHASE_PAUSED = "paused"          # armed, waiting for the next utterance
+RTC_PHASE_CAPTURING = "capturing"    # listening (resumed)
+RTC_PHASE_FINALIZING = "finalizing"  # transient: utterance being handed to STT
+RTC_PHASE_STOPPED = "stopped"        # terminal until a fresh connection
+RTC_ACTIVE_PHASES = (
+    RTC_PHASE_ARMING,
+    RTC_PHASE_PAUSED,
+    RTC_PHASE_CAPTURING,
+    RTC_PHASE_FINALIZING,
+)
+# Re-arm forever with bounded backoff. A transient radio/firmware timing miss
+# must not leave voice input permanently disconnected.
+RTC_ARM_RETRY_DELAYS = (2.0, 5.0, 15.0, 30.0)
+RTC_DOWNLOAD_RESPONSE_RETRIES = 3
+RTC_START_RESPONSE_SETTLE_SECONDS = 0.25
+
+
+class RtcStreamReceiver(StreamReceiver):
+    """Accept only a harmless duplicate initial STREAM_START notification."""
+
+    def _on_start(self, frame: Any) -> None:
+        if (
+            self.started.is_set()
+            and self.frames_received == 0
+            and self.session_id == frame.session_id
+        ):
+            return
+        super()._on_start(frame)
+
+    def fail_start(self, message: str) -> None:
+        """Wake an arm waiter when firmware ends before STREAM_START."""
+        if self.started.is_set():
+            return
+        self._fail(TransferError(message))
+        # StreamReceiver.wait_start() waits on ``started`` only.  Set it after
+        # recording the error so the waiter wakes and raises immediately.
+        self.started.set()
+
+
+def _rtc_partial_stt_default(frames: list[bytes]) -> str:
+    """Rolling partial transcription of a cumulative Ogg snapshot."""
+    from backend.clip.ogg import convert_frames_to_ogg_bytes
+    from backend.llm.stt import transcribe_bytes
+
+    audio = convert_frames_to_ogg_bytes(frames)
+    return transcribe_bytes(
+        audio, filename="clip-rtc-partial.ogg", model=settings.GROQ_RTC_PARTIAL_MODEL
+    )
+
+
+def _rtc_final_stt_default(frames: list[bytes]) -> str:
+    """Authoritative final transcription of one utterance."""
+    from backend.clip.ogg import convert_frames_to_ogg_bytes
+    from backend.llm.stt import transcribe_bytes
+
+    audio = convert_frames_to_ogg_bytes(frames)
+    return transcribe_bytes(
+        audio, filename="clip-rtc-final.ogg", model=settings.GROQ_RTC_FINAL_MODEL
+    )
 
 
 @dataclass
@@ -81,6 +148,12 @@ class IngestRequest:
 
 def _jittered(delay: float) -> float:
     return max(0.05, delay * (1.0 + JITTER_FRACTION * (2.0 * random.random() - 1.0)))
+
+
+def _swallow_task_result(task: asyncio.Task) -> None:
+    """Silence a cancelled worker's result so it cannot spam warnings."""
+    if not task.cancelled():
+        task.exception()
 
 
 def reconnect_delay_seconds(failures: int) -> float:
@@ -97,6 +170,7 @@ class ClipRuntime:
         *,
         transport: Any | None = None,
         device_id: str | None = None,
+        rtc_auto_arm: bool | None = None,
     ) -> None:
         ble_address = settings.CLIP_BLE_ADDRESS.strip()
         ble_name = settings.CLIP_BLE_NAME.strip() or "Clip"
@@ -151,10 +225,52 @@ class ClipRuntime:
         self._event_cond = threading.Condition(threading.Lock())
         self._event_seq = count()
 
+        # RTC live-stream state (warm-pause utterance engine)
+        self.rtc_auto_arm = (
+            bool(settings.RTC_AUTO_ARM) if rtc_auto_arm is None else bool(rtc_auto_arm)
+        )
+        self._rtc_phase = RTC_PHASE_DISCONNECTED
+        self._rtc_session: str | None = None
+        self._rtc_start_accepted = False
+        self._rtc_session_ready = asyncio.Event()
+        self._rtc_event_session: str | None = None
+        # RTC sessions are live-only and never exist in SD storage. Preserve
+        # their ids across failed arms/reconnects so a stale IDLE GSTAT cannot
+        # route one into the legacy ingestion/download workflow.
+        self._rtc_session_ids: set[str] = set()
+        self._rtc_receiver: StreamReceiver | None = None
+        self._rtc_lease_token: int | None = None
+        self._rtc_arm_attempts = 0
+        self._rtc_reconnect_for_arm_failure = False
+        self._rtc_next_arm_at = 0.0
+        self._rtc_arm_started_at = 0.0
+        self._rtc_download_accepted_at: float | None = None
+        self._rtc_device_event_status: str | None = None
+        self._rtc_device_event_at = 0.0
+        self._rtc_device_event_logged_status: str | None = None
+        self._rtc_device_event_logged_at = 0.0
+        self._rtc_last_error: str | None = None
+        self._rtc_generation = 0
+        self._rtc_utterance_id: int | None = None
+        self._rtc_utterance_frames: list[bytes] = []
+        self._rtc_utterance_truncated = False
+        self._rtc_pre_roll: deque[tuple[float, bytes]] = deque(
+            maxlen=max(1, int(settings.RTC_PRE_ROLL_FRAMES))
+        )
+        self._rtc_event_ignore_until = 0.0
+        self._rtc_partial_text = ""
+        self._rtc_partial_inflight = False
+        self._rtc_capture_task: asyncio.Task | None = None
+        self._rtc_finalize_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+        self._rtc_finalize_task: asyncio.Task | None = None
+        self._rtc_finalize_pending = 0
+
         # Injected collaborators (overridden in tests)
         self.audio_service = AudioService()
         self.ogg_converter = convert_session_to_ogg
         self.session_downloader = download_session_compatible
+        self.rtc_stt_partial = _rtc_partial_stt_default
+        self.rtc_stt_final = _rtc_final_stt_default
 
     # ------------------------------------------------------------------
     # Public lifecycle
@@ -164,6 +280,9 @@ class ClipRuntime:
         """Start the supervisor and ingestion loop (called by the worker)."""
         self._ingest_task = asyncio.create_task(self._ingest_loop(), name="clip-ingest")
         self._supervisor_task = asyncio.create_task(self._supervisor(), name="clip-supervisor")
+        self._rtc_finalize_task = asyncio.create_task(
+            self._rtc_finalize_loop(), name="clip-rtc-finalize"
+        )
         try:
             await self._stopping.wait()
         finally:
@@ -171,16 +290,27 @@ class ClipRuntime:
 
     async def shutdown(self) -> None:
         self._stopping.set()
-        for task in (self._supervisor_task, self._ingest_task):
+        for task in (self._supervisor_task, self._ingest_task, self._rtc_finalize_task):
             if task is not None and not task.done():
                 task.cancel()
-        for task in (self._supervisor_task, self._ingest_task):
+        for task in (self._supervisor_task, self._ingest_task, self._rtc_finalize_task):
             if task is not None and not task.done():
                 try:
                     await task
                 except (asyncio.CancelledError, Exception):
                     pass
+        # Best-effort terminal STOP so the device does not keep streaming.
+        if self._rtc_active and self.is_connected:
+            try:
+                await self._client.stop_recording()
+            except Exception:
+                pass
+        await self._rtc_abort(reason="shutdown", finalize=False)
         await self._teardown_transport()
+
+    @property
+    def _rtc_active(self) -> bool:
+        return self._rtc_phase in RTC_ACTIVE_PHASES
 
     # ------------------------------------------------------------------
     # Event hub
@@ -247,9 +377,64 @@ class ClipRuntime:
 
     async def _handle_event(self, payload: dict[str, Any]) -> None:
         event = str(payload.get("event", ""))
+        if event == "rtc":
+            status = str(payload.get("status", "unknown"))
+            now = time.monotonic()
+            self._rtc_device_event_status = status
+            self._rtc_device_event_at = now
+            # BlueZ can replay one response notification while a CCC lease is
+            # being torn down.  Keep the authoritative timestamp above, but do
+            # not publish/log an indistinguishable immediate duplicate.
+            if (
+                status == self._rtc_device_event_logged_status
+                and now - self._rtc_device_event_logged_at < 0.5
+            ):
+                return
+            self._rtc_device_event_logged_status = status
+            self._rtc_device_event_logged_at = now
+            logger.warning("clip RTC firmware event: %s", status)
+            self._push_event(
+                {
+                    "type": "rtc_device",
+                    "status": status,
+                    "session": self._rtc_session,
+                }
+            )
+            return
         if event == "state":
             state = str(payload.get("state", "")).upper()
             session: str | None = payload.get("session") if isinstance(payload.get("session"), str) else None
+            if (
+                self._rtc_phase == RTC_PHASE_ARMING
+                and state == "STREAMING"
+                and session
+            ):
+                # Firmware may acknowledge AT+START=rtc with an empty data
+                # object while the audio thread is still publishing its
+                # session id.  The state event is authoritative in that
+                # startup window and normally arrives before the response.
+                if session not in self._rtc_session_ids:
+                    self._rtc_event_session = session
+                    self._rtc_session = session
+                    self._rtc_session_ids.add(session)
+                    self._rtc_session_ready.set()
+                else:
+                    logger.debug(
+                        "ignoring replayed RTC STREAMING event for %s", session
+                    )
+            if self._rtc_active:
+                # While an RTC session is armed the firmware state machine is
+                # RTC-owned: STREAMING = resumed/capturing, PAUSED = warm pause,
+                # IDLE = terminal stop. Never mixes with SD-record ingestion.
+                if state == "STREAMING":
+                    await self._rtc_handle_streaming()
+                elif state == "PAUSED":
+                    await self._rtc_handle_paused()
+                elif state == "IDLE":
+                    await self._rtc_handle_idle(session)
+                else:
+                    logger.debug("clip state event %s ignored while RTC armed", state)
+                return
             if state in ("RECORDING", "PAUSED"):
                 await self._observe_recording_started(session or self._recording_session)
             elif state == "IDLE":
@@ -271,6 +456,10 @@ class ClipRuntime:
             raise ClipInputError("mode must be 'normal' or 'enhanced'")
         if self._recording:
             raise ClipConflictError("Clip is already recording")
+        if self._rtc_active:
+            raise ClipConflictError(
+                "RTC live stream is armed; it owns the file-frame channel"
+            )
         if self._transfer_active:
             raise ClipConflictError("a download is in progress; stop or wait for it first")
 
@@ -293,6 +482,10 @@ class ClipRuntime:
         }
 
     async def stop_recording(self) -> dict[str, Any]:
+        if self._rtc_active:
+            # STOP is terminal for RTC: finalize the live utterance, end the
+            # stream and detach the receiver lease.
+            return await self.rtc_stop()
         if not self._recording and not self._recording_session:
             raise ClipConflictError("Clip is not recording")
         if self._transfer_active:
@@ -371,7 +564,11 @@ class ClipRuntime:
                     "trigger": trigger,
                 }
             )
-        if sid:
+        # Enqueue ingestion only on the first observation of the stop (a
+        # firmware IDLE notification may race the direct web call; the second
+        # call sees was_recording=False and must not overwrite the trigger).
+        # Untracked stops are recovered by the heartbeat's reconnect branch.
+        if sid and was_recording:
             await self._request_ingest(sid, trigger=trigger)
 
     def _poll_recording_active(self, status: Any) -> bool:
@@ -379,6 +576,11 @@ class ClipRuntime:
 
     async def _apply_status(self, status: Any) -> None:
         """Reconcile polling against observed events (idempotent)."""
+        if self._rtc_active:
+            # RTC owns the session: GSTAT reports STREAMING/PAUSED and RTC
+            # sessions are never SD recordings, so legacy reconciliation
+            # (ingest rows, download enqueue) must not run here.
+            return
         recording = self._poll_recording_active(status)
         sid = getattr(status, "session_id", None)
         if recording and sid and sid != self._recording_session:
@@ -391,7 +593,12 @@ class ClipRuntime:
             await self._observe_recording_stopped(sid)
         elif recording and not self._recording_session and sid:
             await self._observe_recording_started(sid)
-        elif not recording and sid and self._baseline_done:
+        elif (
+            not recording
+            and sid
+            and sid not in self._rtc_session_ids
+            and self._baseline_done
+        ):
             # Firmware keeps the most recently stopped session in GSTAT while
             # IDLE.  This recovers a physical-button stop missed during a BLE
             # outage without an unstable paginated AT+LIST history scan.
@@ -408,6 +615,17 @@ class ClipRuntime:
         except Exception:
             return False
 
+    @property
+    def _legacy_ingest_pending(self) -> bool:
+        """Whether an SD ingestion owns priority over RTC auto-arm.
+
+        Recovery queues are populated during ``_on_connected`` before the
+        ingestion coroutine has a chance to enter ``_download_session``.  The
+        queued-session check closes that scheduling window; the retry-owner
+        check covers the transfer/reconnect window after dequeue.
+        """
+        return bool(self._queued_sessions) or self._download_retry_owner
+
     async def _connect(self) -> None:
         async with self._connect_lock:
             if self._client.is_connected:
@@ -420,6 +638,7 @@ class ClipRuntime:
         self._ready = False
         self._connection_ready.clear()
         self._transport_lost.set()
+        await self._rtc_abort(reason="disconnected", finalize=True)
         try:
             await self._client.disconnect()
         except Exception:
@@ -436,6 +655,10 @@ class ClipRuntime:
                 self._ready = False
                 self._connection_ready.clear()
                 self._transport_lost.set()
+                try:
+                    await self._rtc_abort(reason="disconnected", finalize=True)
+                except Exception as exc:
+                    logger.debug("clip RTC abort on link loss: %s", exc)
                 conn_payload: dict[str, Any] = {
                     "type": "connection",
                     "connected": False,
@@ -489,6 +712,19 @@ class ClipRuntime:
                     logger.warning("clip heartbeat failed: %s", exc)
                     self._last_error = str(exc)
                     await self._teardown_transport()
+                if (
+                    self.rtc_auto_arm
+                    and not self._legacy_ingest_pending
+                    and self._rtc_phase == RTC_PHASE_DISCONNECTED
+                    and time.monotonic() >= self._rtc_next_arm_at
+                    and self._ready
+                    and self.is_connected
+                    and not self._stopping.is_set()
+                ):
+                    try:
+                        await self._arm_rtc()
+                    except Exception as exc:
+                        logger.warning("clip RTC re-arm attempt failed: %s", exc)
                 interval = max(0.5, settings.CLIP_STATUS_INTERVAL)
                 try:
                     await asyncio.wait_for(self._stopping.wait(), timeout=interval)
@@ -515,6 +751,34 @@ class ClipRuntime:
             self._last_error = None
             self._transport_lost.clear()
             self._connection_ready.set()
+            if self._rtc_reconnect_for_arm_failure:
+                # Preserve the bounded arm-attempt count across a reconnect
+                # requested specifically to discard a suspect command stream.
+                self._rtc_reconnect_for_arm_failure = False
+            else:
+                self._rtc_arm_attempts = 0
+                self._rtc_next_arm_at = 0.0
+            if self._rtc_phase == RTC_PHASE_STOPPED:
+                # A fresh connection re-arms a new RTC session.
+                self._rtc_phase = RTC_PHASE_DISCONNECTED
+
+        # Auto-arm the live RTC session after every baseline/recovery.  A
+        # failure is non-fatal: the supervisor retries with bounded backoff.
+        if (
+            self.rtc_auto_arm
+            and not self._legacy_ingest_pending
+            and time.monotonic() >= self._rtc_next_arm_at
+        ):
+            try:
+                await self._arm_rtc()
+            except Exception as exc:
+                logger.exception("clip RTC auto-arm failed: %s", exc)
+
+        # A failed arm may deliberately close a response stream that can no
+        # longer be trusted.  Do not publish a contradictory connected event;
+        # the supervisor will establish the replacement link next iteration.
+        if not self._ready or not self.is_connected:
+            return
 
         connected_event = {
             "type": "connection",
@@ -615,22 +879,791 @@ class ClipRuntime:
         the supervisor performs a clean reconnect before any next command.
         """
         async with self._operation_lock:
-            if not self.is_connected:
-                raise ClipUnavailableError("Clip is not connected or is reconnecting")
+            return await self._run_command(operation)
+
+    async def _run_command(self, operation: Callable[[], Any]) -> Any:
+        """Run a command assuming the manager lock is held (mapping errors).
+
+        Used by ``_call`` and by the RTC arming sequence, which runs inside
+        ``_on_connected``'s lock and therefore cannot re-acquire it.
+        """
+        if not self.is_connected:
+            raise ClipUnavailableError("Clip is not connected or is reconnecting")
+        try:
+            value = await operation()
+        except CommandError as exc:
+            message = str(exc).lower()
+            if any(hint in message for hint in _CONFLICT_HINTS):
+                raise ClipConflictError(str(exc)) from exc
+            raise ClipCommandFailedError(str(exc)) from exc
+        except (CommandTimeoutError, ClipConnectionError, ProtocolError) as exc:
+            await self._teardown_transport()
+            raise ClipUnavailableError(str(exc)) from exc
+        except ClipError as exc:
+            raise ClipCommandFailedError(str(exc)) from exc
+        self._reconnect_failures = 0
+        return value
+
+    # ------------------------------------------------------------------
+    # RTC live streaming (warm-pause utterances)
+    # ------------------------------------------------------------------
+
+    def _rtc_on_frame(self, payload: bytes) -> None:
+        """Synchronous receive-path callback: O(1) append + ring buffer only.
+
+        Never performs file I/O, network, decoding or locking on the BLE
+        receive path. Frames captured while CAPTURING append to the current
+        utterance buffer (hard-bounded); frames around transitions land in a
+        small pre-roll ring that seeds the next utterance so the first words
+        after a physical double-click are not lost.
+        """
+        if self._rtc_phase == RTC_PHASE_CAPTURING:
+            if len(self._rtc_utterance_frames) < settings.RTC_MAX_UTTERANCE_FRAMES:
+                self._rtc_utterance_frames.append(payload)
+            else:
+                self._rtc_utterance_truncated = True
+        else:
+            self._rtc_pre_roll.append((time.monotonic(), payload))
+
+    def _consume_pre_roll(self) -> list[bytes]:
+        """Seed a new utterance with tentative first frames (bounded ring)."""
+        frames = [payload for _, payload in self._rtc_pre_roll]
+        self._rtc_pre_roll.clear()
+        return frames
+
+    async def _rtc_begin_capture(self, trigger: str) -> None:
+        """Transition to CAPTURING and start the next logical utterance."""
+        if self._rtc_phase == RTC_PHASE_CAPTURING:
+            return  # duplicate STREAMING / double-click: already listening
+        self._rtc_generation += 1
+        uid = self._rtc_generation
+        self._rtc_utterance_id = uid
+        self._rtc_utterance_frames = self._consume_pre_roll()
+        self._rtc_utterance_truncated = False
+        self._rtc_partial_text = ""
+        self._rtc_partial_inflight = False
+        self._rtc_phase = RTC_PHASE_CAPTURING
+        self._push_event(
+            {
+                "type": "rtc_state",
+                "phase": RTC_PHASE_CAPTURING,
+                "session": self._rtc_session,
+                "utterance_id": uid,
+                "trigger": trigger,
+            }
+        )
+        if self._rtc_capture_task is not None and not self._rtc_capture_task.done():
+            self._rtc_capture_task.cancel()
+            self._rtc_capture_task.add_done_callback(_swallow_task_result)
+        self._rtc_capture_task = asyncio.create_task(
+            self._rtc_capture_worker(uid), name=f"clip-rtc-capture-{uid}"
+        )
+
+    async def _rtc_capture_worker(self, uid: int) -> None:
+        """Rolling partial STT: latest-wins, at most one request in flight."""
+        interval = max(0.2, float(settings.RTC_PARTIAL_INTERVAL))
+        while not self._stopping.is_set():
+            if (
+                self._rtc_utterance_id != uid
+                or self._rtc_phase != RTC_PHASE_CAPTURING
+            ):
+                return
             try:
-                value = await operation()
-            except CommandError as exc:
-                message = str(exc).lower()
-                if any(hint in message for hint in _CONFLICT_HINTS):
-                    raise ClipConflictError(str(exc)) from exc
-                raise ClipCommandFailedError(str(exc)) from exc
-            except (CommandTimeoutError, ClipConnectionError, ProtocolError) as exc:
-                await self._teardown_transport()
-                raise ClipUnavailableError(str(exc)) from exc
-            except ClipError as exc:
-                raise ClipCommandFailedError(str(exc)) from exc
-            self._reconnect_failures = 0
-            return value
+                await asyncio.wait_for(self._stopping.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            if self._stopping.is_set():
+                return
+            if (
+                self._rtc_utterance_id != uid
+                or self._rtc_phase != RTC_PHASE_CAPTURING
+            ):
+                return
+            if self._rtc_partial_inflight:
+                continue
+            if len(self._rtc_utterance_frames) < settings.RTC_PARTIAL_MIN_FRAMES:
+                continue
+            snapshot = list(self._rtc_utterance_frames)
+            self._rtc_partial_inflight = True
+            try:
+                text = await asyncio.to_thread(self.rtc_stt_partial, snapshot)
+            except Exception as exc:
+                logger.warning("clip RTC partial STT failed: %s", exc)
+                continue
+            finally:
+                self._rtc_partial_inflight = False
+            text = (text or "").strip()
+            # latest-wins: apply only while this utterance is still live.
+            if (
+                text
+                and self._rtc_utterance_id == uid
+                and self._rtc_phase == RTC_PHASE_CAPTURING
+                and text != self._rtc_partial_text
+            ):
+                self._rtc_partial_text = text
+                self._push_event(
+                    {
+                        "type": "transcript",
+                        "utterance_id": uid,
+                        "session": self._rtc_session,
+                        "text": text,
+                        "final": False,
+                    }
+                )
+
+    async def _rtc_finalize_utterance(self, reason: str) -> bool:
+        """Finalize the live utterance exactly once (idempotent).
+
+        Decoupled from the LLM: the job is queued (FIFO) and processed by the
+        background finalize worker, so the next utterance can start while the
+        previous one is still transcribing/thinking.
+        """
+        if self._rtc_phase != RTC_PHASE_CAPTURING:
+            return False
+        uid = self._rtc_utterance_id
+        frames = list(self._rtc_utterance_frames)
+        truncated = self._rtc_utterance_truncated
+        # Claim the FINALIZING phase before any await: a second concurrent
+        # finalize (late firmware PAUSED vs web pause) sees non-CAPTURING and
+        # returns False, so finalization is exactly once.
+        self._rtc_phase = RTC_PHASE_FINALIZING
+        self._rtc_utterance_frames = []
+        self._rtc_utterance_truncated = False
+        self._rtc_partial_inflight = False
+        if self._rtc_capture_task is not None and not self._rtc_capture_task.done():
+            # Cancel without awaiting: the worker only touches the same fields
+            # the next capture re-initializes, and a stale result is discarded
+            # by its uid/phase guards. No await keeps finalization atomic.
+            self._rtc_capture_task.cancel()
+            self._rtc_capture_task.add_done_callback(_swallow_task_result)
+        self._rtc_capture_task = None
+        self._push_event(
+            {
+                "type": "rtc_state",
+                "phase": RTC_PHASE_FINALIZING,
+                "session": self._rtc_session,
+                "utterance_id": uid,
+                "reason": reason,
+            }
+        )
+        job = {
+            "utterance_id": uid,
+            "session": self._rtc_session,
+            "frames": frames,
+            "reason": reason,
+            "truncated": truncated,
+            "conversation_id": self._active_conversation,
+        }
+        # Bounded FIFO: only on a pathological backlog drop the oldest job.
+        if self._rtc_finalize_pending >= settings.RTC_MAX_PENDING_FINALIZE:
+            try:
+                self._rtc_finalize_queue.get_nowait()
+                self._rtc_finalize_pending -= 1
+            except asyncio.QueueEmpty:
+                pass
+        self._rtc_finalize_queue.put_nowait(job)
+        self._rtc_finalize_pending += 1
+        self._rtc_phase = RTC_PHASE_PAUSED
+        self._push_event(
+            {
+                "type": "rtc_state",
+                "phase": RTC_PHASE_PAUSED,
+                "session": self._rtc_session,
+                "utterance_id": uid,
+            }
+        )
+        return True
+
+    async def _rtc_finalize_loop(self) -> None:
+        """FIFO worker: final STT then exactly one process_transcript."""
+        while True:
+            job = await self._rtc_finalize_queue.get()
+            try:
+                await self._rtc_finalize_job(job)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.exception("clip RTC finalize failed: %s", exc)
+                self._push_event(
+                    {
+                        "type": "rtc_state",
+                        "phase": RTC_PHASE_PAUSED,
+                        "session": job.get("session"),
+                        "utterance_id": job.get("utterance_id"),
+                        "error": str(exc),
+                    }
+                )
+            finally:
+                self._rtc_finalize_pending = max(0, self._rtc_finalize_pending - 1)
+
+    async def _rtc_finalize_job(self, job: dict[str, Any]) -> None:
+        uid = job["utterance_id"]
+        frames = job["frames"]
+        session = job.get("session")
+        if len(frames) < settings.RTC_MIN_UTTERANCE_FRAMES:
+            # Empty / too-short utterance: never invoke the LLM.
+            self._push_event(
+                {
+                    "type": "transcript",
+                    "utterance_id": uid,
+                    "session": session,
+                    "text": "",
+                    "final": True,
+                    "skipped": "too short",
+                }
+            )
+            return
+        try:
+            text = await asyncio.to_thread(self.rtc_stt_final, frames)
+        except Exception as exc:
+            logger.warning("clip RTC final STT failed for %s: %s", uid, exc)
+            self._push_event(
+                {
+                    "type": "rtc_state",
+                    "phase": RTC_PHASE_PAUSED,
+                    "session": session,
+                    "utterance_id": uid,
+                    "error": f"final transcription failed: {exc}",
+                }
+            )
+            return
+        text = (text or "").strip()
+        self._push_event(
+            {
+                "type": "transcript",
+                "utterance_id": uid,
+                "session": session,
+                "text": text,
+                "final": True,
+            }
+        )
+        if not text:
+            return
+
+        # Streamed reply: emit tool-call ("thinking") and token events so the
+        # frontend shows LLM progress instead of a silent "Armed" wait. Falls
+        # back to the blocking pipeline when the injected audio_service only
+        # provides the legacy method (keeps existing tests/stubs intact).
+        def _stream_emit(event: dict[str, Any]) -> None:
+            ev: dict[str, Any] = {
+                "type": event.get("type"),
+                "session": session,
+                "utterance_id": uid,
+            }
+            if event.get("tool"):
+                ev["tool"] = event["tool"]
+            elif event.get("text") is not None:
+                ev["text"] = event["text"]
+            self._push_event(ev)
+
+        stream_proc = getattr(self.audio_service, "process_transcript_stream", None)
+        try:
+            if stream_proc is not None:
+                outcome = await asyncio.to_thread(
+                    stream_proc, text, job.get("conversation_id"), _stream_emit
+                )
+            else:
+                outcome = await asyncio.to_thread(
+                    self.audio_service.process_transcript,
+                    text,
+                    job.get("conversation_id"),
+                )
+        except Exception as exc:
+            logger.exception(
+                "clip RTC process_transcript failed for %s: %s", uid, exc
+            )
+            self._push_event(
+                {
+                    "type": "rtc_state",
+                    "phase": RTC_PHASE_PAUSED,
+                    "session": session,
+                    "utterance_id": uid,
+                    "error": f"processing failed: {exc}",
+                }
+            )
+            return
+        self._push_event(
+            {
+                "type": "result",
+                "session": session,
+                "utterance_id": uid,
+                "conversation_id": outcome.get("conversation_id"),
+                "transcript": outcome.get("transcript") or text,
+                "response": outcome.get("response", ""),
+                "trigger": "rtc",
+            }
+        )
+
+    # -- firmware event entry points --------------------------------------
+
+    async def _rtc_handle_streaming(self) -> None:
+        """Firmware STREAMING: RTC active (resumed / initial stream flow)."""
+        if time.monotonic() < self._rtc_event_ignore_until:
+            # Initial-stream notification lagging behind the arm sequence.
+            return
+        if self._rtc_phase == RTC_PHASE_CAPTURING:
+            return
+        if self._rtc_phase in (RTC_PHASE_PAUSED, RTC_PHASE_FINALIZING):
+            await self._rtc_begin_capture("device")
+        # ARMING: initial stream start before our own AT+PAUSE; nothing to do.
+
+    async def _rtc_handle_paused(self) -> None:
+        """Firmware PAUSED: warm pause ends the current utterance."""
+        if time.monotonic() < self._rtc_event_ignore_until:
+            # The arm sequence's own PAUSED arriving after the arm finished.
+            if self._rtc_phase == RTC_PHASE_ARMING:
+                self._rtc_phase = RTC_PHASE_PAUSED
+            return
+        if self._rtc_phase == RTC_PHASE_ARMING:
+            # The arm sequence's own AT+PAUSE; arming moves to PAUSED itself.
+            self._rtc_phase = RTC_PHASE_PAUSED
+            return
+        await self._rtc_finalize_utterance("paused")
+
+    async def _rtc_handle_idle(self, session: str | None) -> None:
+        """Firmware IDLE while RTC armed: terminal stop (STOP/power-off)."""
+        if not self._rtc_active:
+            return
+        if session and self._rtc_session and session != self._rtc_session:
+            # STOP/timeout notifications are scheduled independently by the
+            # firmware.  A delayed IDLE from the prior RTC session must never
+            # tear down the receiver lease installed for its successor.
+            logger.debug(
+                "ignoring stale RTC IDLE for %s while %s is active",
+                session,
+                self._rtc_session,
+            )
+            return
+        if self._rtc_phase == RTC_PHASE_ARMING:
+            # A firmware watchdog can end the session before STREAM_START.
+            # This is a retryable arm failure, not the user's terminal STOP.
+            receiver = self._rtc_receiver
+            if isinstance(receiver, RtcStreamReceiver):
+                now = time.monotonic()
+                age = max(0.0, now - self._rtc_arm_started_at)
+                download_age = (
+                    f"{max(0.0, now - self._rtc_download_accepted_at):.2f}s"
+                    if self._rtc_download_accepted_at is not None
+                    else "not-acknowledged"
+                )
+                firmware_status = (
+                    self._rtc_device_event_status
+                    if self._rtc_device_event_at >= self._rtc_arm_started_at
+                    else "none"
+                )
+                receiver.fail_start(
+                    "RTC session ended before stream start "
+                    f"(session={self._rtc_session or session}, age={age:.2f}s, "
+                    f"download_ack_age={download_age}, firmware_event={firmware_status})"
+                )
+            return
+        await self._rtc_finalize_utterance("stopped")
+        await self._rtc_mark_stopped()
+
+    # -- web control -------------------------------------------------------
+
+    async def rtc_resume(self) -> dict[str, Any]:
+        """Resume the armed RTC session: start the next logical utterance."""
+        if not self._rtc_active:
+            raise ClipConflictError("RTC live stream is not armed")
+        if self._rtc_phase == RTC_PHASE_CAPTURING:
+            # Already listening (e.g. a physical double-click won the race).
+            return {
+                "accepted": True,
+                "phase": self._rtc_phase,
+                "session": self._rtc_session,
+                "utterance_id": self._rtc_utterance_id,
+            }
+        try:
+            await self._call(lambda: self._client.resume_recording())
+        except ClipConflictError:
+            pass  # firmware already resumed; the STREAMING event drives it
+        await self._rtc_begin_capture("web")
+        return {
+            "accepted": True,
+            "phase": self._rtc_phase,
+            "session": self._rtc_session,
+            "utterance_id": self._rtc_utterance_id,
+        }
+
+    async def rtc_pause(self) -> dict[str, Any]:
+        """Pause the RTC session and finalize the current utterance."""
+        if not self._rtc_active:
+            raise ClipConflictError("RTC live stream is not armed")
+        if self._rtc_phase in (RTC_PHASE_PAUSED, RTC_PHASE_ARMING):
+            # Already paused: idempotent, no duplicate finalization.
+            return {
+                "accepted": True,
+                "phase": RTC_PHASE_PAUSED,
+                "session": self._rtc_session,
+                "utterance_id": self._rtc_utterance_id,
+            }
+        try:
+            await self._call(lambda: self._client.pause_recording())
+        except ClipConflictError:
+            pass  # a physical double-click may have paused first
+        await self._rtc_handle_paused()
+        return {
+            "accepted": True,
+            "phase": self._rtc_phase,
+            "session": self._rtc_session,
+            "utterance_id": self._rtc_utterance_id,
+        }
+
+    async def rtc_stop(self) -> dict[str, Any]:
+        """Terminal RTC STOP: end the stream, detach, no re-arm until reconnect."""
+        if not self._rtc_active:
+            raise ClipConflictError("RTC live stream is not armed")
+        session = self._rtc_session
+        await self._rtc_finalize_utterance("stopped")
+        try:
+            result = await self._call(lambda: self._client.stop_recording())
+        except (ClipConflictError, ClipCommandFailedError) as exc:
+            result = {"error": str(exc)}
+        await self._rtc_mark_stopped()
+        return {"accepted": True, "session": session, "data": result}
+
+    # -- arming / teardown -------------------------------------------------
+
+    async def _arm_rtc(self) -> dict[str, Any]:
+        """Auto-arm RTC after connect: start_rtc -> stream -> warm pause."""
+        if self._rtc_active or self._rtc_phase == RTC_PHASE_STOPPED:
+            return {"armed": False, "reason": f"rtc phase is {self._rtc_phase}"}
+        if self._legacy_ingest_pending:
+            return {"armed": False, "reason": "SD ingestion is pending"}
+        async with self._operation_lock:
+            # An ingestion can be queued while this coroutine is waiting for
+            # another command to release the operation lock.
+            if self._legacy_ingest_pending:
+                return {"armed": False, "reason": "SD ingestion is pending"}
+            return await self._arm_rtc_locked()
+
+    async def _arm_rtc_locked(self) -> dict[str, Any]:
+        if not self.is_connected or not self._ready:
+            return {"armed": False, "reason": "not connected"}
+        self._rtc_pre_roll.clear()
+        self._rtc_start_accepted = False
+        self._rtc_session_ready.clear()
+        self._rtc_event_session = None
+        self._rtc_arm_started_at = time.monotonic()
+        self._rtc_download_accepted_at = None
+        self._rtc_device_event_status = None
+        self._rtc_device_event_at = 0.0
+        self._rtc_phase = RTC_PHASE_ARMING
+        self._rtc_last_error = None
+        self._push_event(
+            {
+                "type": "rtc_state",
+                "phase": RTC_PHASE_ARMING,
+                "session": None,
+                "utterance_id": self._rtc_utterance_id,
+            }
+        )
+        try:
+            session = await self._run_command(self._start_rtc_session)
+        except Exception as exc:
+            reconnect = self._rtc_start_accepted
+            if reconnect:
+                await self._rtc_cleanup_failed_arm()
+            return await self._rtc_arm_failed(exc, reconnect=reconnect)
+        self._rtc_session_ids.add(session)
+        self._rtc_session = session
+        # The response characteristic can replay START once on a freshly
+        # subscribed BlueZ link.  Let that duplicate reach the queue before
+        # send_command() performs its pre-DOWNLOAD drain; otherwise the replay
+        # can arrive just after the drain and masquerade as DOWNLOAD's reply.
+        await asyncio.sleep(RTC_START_RESPONSE_SETTLE_SECONDS)
+        receiver = RtcStreamReceiver(on_frame=self._rtc_on_frame)
+        self._rtc_receiver = receiver
+        try:
+            token = await self._run_command(
+                lambda: self._start_rtc_stream_checked(session, receiver)
+            )
+        except Exception as exc:
+            await self._rtc_cleanup_failed_arm()
+            return await self._rtc_arm_failed(exc, reconnect=True)
+        self._rtc_lease_token = token
+        self._rtc_download_accepted_at = time.monotonic()
+        try:
+            await asyncio.wait_for(
+                receiver.wait_start(timeout=settings.RTC_ARM_TIMEOUT),
+                timeout=settings.RTC_ARM_TIMEOUT + 1.0,
+            )
+        except Exception as exc:
+            # The stream never started; release both the receiver lease and
+            # the device-side RTC session before a later retry.
+            await self._rtc_cleanup_failed_arm()
+            return await self._rtc_arm_failed(exc, reconnect=True)
+        try:
+            await self._run_command(lambda: self._client.pause_recording())
+        except ClipConflictError:
+            pass  # firmware already warm-paused
+        except Exception as exc:
+            await self._rtc_cleanup_failed_arm()
+            return await self._rtc_arm_failed(exc)
+        self._rtc_pre_roll.clear()  # discard initial stream frames
+        self._rtc_event_ignore_until = (
+            time.monotonic() + float(settings.RTC_SETTLE_SECONDS)
+        )
+        self._rtc_phase = RTC_PHASE_PAUSED
+        self._rtc_arm_attempts = 0
+        self._rtc_next_arm_at = 0.0
+        self._push_event(
+            {
+                "type": "rtc_state",
+                "phase": RTC_PHASE_PAUSED,
+                "session": session,
+                "utterance_id": self._rtc_utterance_id,
+            }
+        )
+        return {"armed": True, "session": session, "phase": RTC_PHASE_PAUSED}
+
+    async def _start_rtc_stream_checked(
+        self, session: str, receiver: StreamReceiver
+    ) -> int | None:
+        """Attach the frame sink and accept only this DOWNLOAD's response.
+
+        The wire protocol has no request id and BLE commands use Write Without
+        Response.  After reconnect, a delayed duplicate START response can
+        otherwise be consumed as the DOWNLOAD reply while the actual write is
+        lost.  Retry a shape-mismatched reply inside the firmware's five-second
+        watchdog; a real STREAM_START notification is independently
+        authoritative even if its JSON acknowledgement was malformed.
+        """
+        transport = self._client.transport
+        token = transport.set_file_frame_handler(receiver.feed)
+        command = f"AT+DOWNLOAD={session}"
+        last_response: dict[str, Any] | None = None
+        try:
+            for attempt in range(1, RTC_DOWNLOAD_RESPONSE_RETRIES + 1):
+                response = await self._client.request(command)
+                last_response = response
+                data = response.get("data")
+                response_matches = (
+                    isinstance(data, dict)
+                    and str(data.get("state", "")).lower() == "streaming"
+                    and data.get("session") == session
+                )
+                if response_matches or (
+                    receiver.started.is_set() and receiver.error is None
+                ):
+                    return token
+                logger.warning(
+                    "ignoring mismatched RTC DOWNLOAD response (%d/%d): %s",
+                    attempt,
+                    RTC_DOWNLOAD_RESPONSE_RETRIES,
+                    response,
+                )
+                if attempt < RTC_DOWNLOAD_RESPONSE_RETRIES:
+                    # Give an already-sent STREAM_START notification one event
+                    # loop turn to arrive before retransmitting DOWNLOAD.
+                    await asyncio.sleep(RTC_START_RESPONSE_SETTLE_SECONDS)
+                    if receiver.error is not None:
+                        raise receiver.error
+                    if receiver.started.is_set():
+                        return token
+            raise ProtocolError(
+                f"RTC DOWNLOAD response did not match session {session}: "
+                f"{last_response}"
+            )
+        except Exception:
+            if token is not None:
+                transport.detach_file_frame_handler(token)
+            else:
+                transport.set_file_frame_handler(None)
+            raise
+
+    async def _start_rtc_session(self) -> str:
+        """Start RTC and take its SID from the authoritative state event."""
+        response = await self._client.request("AT+START=rtc")
+        self._rtc_start_accepted = True
+        data = response.get("data") if isinstance(response, dict) else None
+        response_session = data.get("session") if isinstance(data, dict) else None
+
+        # Firmware publishes STREAMING from the state machine before the
+        # START handler returns JSON.  Require that fresh event because the
+        # response characteristic can replay a plausible response belonging
+        # to a prior, already-ended RTC session after reconnect.
+        try:
+            await asyncio.wait_for(self._rtc_session_ready.wait(), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+        if self._rtc_event_session:
+            if (
+                isinstance(response_session, str)
+                and response_session
+                and response_session != self._rtc_event_session
+            ):
+                logger.warning(
+                    "ignoring stale RTC START response SID %s; "
+                    "state event reports %s",
+                    response_session,
+                    self._rtc_event_session,
+                )
+            return self._rtc_event_session
+        raise ClipCommandFailedError(
+            "RTC START response was not accompanied by a fresh STREAMING event "
+            f"(response_session={response_session!r})"
+        )
+
+    async def _rtc_cleanup_failed_arm(self) -> None:
+        """Roll back a partially-created RTC session without dropping BLE."""
+        session_started = self._rtc_start_accepted or self._rtc_session is not None
+        firmware_already_ended = (
+            self._rtc_device_event_status == "timeout"
+            and self._rtc_device_event_at >= self._rtc_arm_started_at
+        )
+        transport = getattr(self._client, "transport", None)
+        token = self._rtc_lease_token
+        # Mark inactive before AT+STOP can emit IDLE asynchronously; otherwise
+        # that event races the failed-arm bookkeeping and can leave STOPPED.
+        self._rtc_phase = RTC_PHASE_DISCONNECTED
+        if transport is not None and token is not None:
+            try:
+                transport.detach_file_frame_handler(token)
+            except Exception:
+                pass
+        self._rtc_lease_token = None
+        self._rtc_receiver = None
+        self._rtc_session = None
+        self._rtc_start_accepted = False
+        self._rtc_session_ready.clear()
+        self._rtc_event_session = None
+        self._rtc_pre_roll.clear()
+        if session_started and self.is_connected and not firmware_already_ended:
+            try:
+                # The caller already owns _operation_lock. Use the SDK call
+                # directly so rollback remains serialized without re-locking.
+                await self._client.stop_recording()
+            except Exception as stop_exc:
+                logger.debug("clip RTC failed-arm STOP rejected: %s", stop_exc)
+
+    async def _rtc_arm_failed(
+        self, exc: Exception, *, reconnect: bool = False
+    ) -> dict[str, Any]:
+        """Record an arming failure and optionally retry on a fresh link."""
+        self._rtc_last_error = str(exc)
+        self._rtc_arm_attempts += 1
+        retry_delay = RTC_ARM_RETRY_DELAYS[
+            min(self._rtc_arm_attempts - 1, len(RTC_ARM_RETRY_DELAYS) - 1)
+        ]
+        self._rtc_next_arm_at = time.monotonic() + retry_delay
+        self._rtc_phase = RTC_PHASE_DISCONNECTED
+        logger.warning(
+            "clip RTC arm failed (attempt %d; retry in %.0fs): %s",
+            self._rtc_arm_attempts,
+            retry_delay,
+            exc,
+        )
+        self._push_event(
+            {
+                "type": "rtc_state",
+                "phase": RTC_PHASE_DISCONNECTED,
+                "session": None,
+                "utterance_id": self._rtc_utterance_id,
+                "error": str(exc),
+                "retry_seconds": retry_delay,
+            }
+        )
+        firmware_watchdog_after_download = (
+            self._rtc_download_accepted_at is not None
+            and self._rtc_device_event_status == "timeout"
+            and self._rtc_device_event_at >= self._rtc_arm_started_at
+        )
+        if reconnect and self.is_connected and not firmware_watchdog_after_download:
+            # An early IDLE or missing stream frame can race a late response
+            # from the failed cleanup STOP.  Never issue the next GSTAT/START
+            # on that response stream; reconnect gives the protocol a clean
+            # queue and a fresh file-notification subscription.
+            self._rtc_reconnect_for_arm_failure = True
+            logger.warning(
+                "discarding BLE connection after RTC arm failure; "
+                "retrying on a fresh link after %.0fs",
+                retry_delay,
+            )
+            await self._teardown_transport()
+        elif reconnect and self.is_connected:
+            # The firmware waits for a tight BLE connection interval before
+            # emitting STREAM_START.  On a cold Linux/BlueZ link that update
+            # can collide with its five-second START watchdog.  Reconnecting
+            # here makes every attempt cold and can reproduce the collision
+            # forever.  DOWNLOAD was acknowledged and the later STOP cleanup
+            # was serialized, so this command stream is still trustworthy;
+            # retain it and retry after the negotiated parameters settle.
+            logger.warning(
+                "retaining BLE connection after firmware RTC watchdog; "
+                "retrying on the settled link after %.0fs",
+                retry_delay,
+            )
+        return {"armed": False, "error": str(exc)}
+
+    async def _rtc_mark_stopped(self) -> None:
+        """Detach the lease and move to the terminal STOPPED phase."""
+        transport = getattr(self._client, "transport", None)
+        token = self._rtc_lease_token
+        if transport is not None and token is not None:
+            try:
+                transport.detach_file_frame_handler(token)
+            except Exception:
+                pass
+        self._rtc_lease_token = None
+        self._rtc_receiver = None
+        self._rtc_session = None
+        self._rtc_start_accepted = False
+        self._rtc_session_ready.clear()
+        self._rtc_event_session = None
+        self._rtc_utterance_frames = []
+        self._rtc_utterance_truncated = False
+        self._rtc_pre_roll.clear()
+        self._rtc_phase = RTC_PHASE_STOPPED
+        self._push_event(
+            {
+                "type": "rtc_state",
+                "phase": RTC_PHASE_STOPPED,
+                "session": None,
+                "utterance_id": self._rtc_utterance_id,
+            }
+        )
+
+    async def _rtc_abort(self, *, reason: str, finalize: bool) -> None:
+        """Idempotent cleanup of an armed RTC session (BLE loss/shutdown)."""
+        was_active = self._rtc_active
+        if not was_active and self._rtc_lease_token is None:
+            return
+        if finalize and self._rtc_phase == RTC_PHASE_CAPTURING:
+            await self._rtc_finalize_utterance(reason)
+        if self._rtc_capture_task is not None and not self._rtc_capture_task.done():
+            self._rtc_capture_task.cancel()
+            self._rtc_capture_task.add_done_callback(_swallow_task_result)
+        self._rtc_capture_task = None
+        transport = getattr(self._client, "transport", None)
+        token = self._rtc_lease_token
+        if transport is not None and token is not None:
+            try:
+                transport.detach_file_frame_handler(token)
+            except Exception:
+                pass
+        self._rtc_lease_token = None
+        self._rtc_receiver = None
+        self._rtc_session = None
+        self._rtc_start_accepted = False
+        self._rtc_session_ready.clear()
+        self._rtc_event_session = None
+        self._rtc_utterance_frames = []
+        self._rtc_utterance_truncated = False
+        self._rtc_pre_roll.clear()
+        self._rtc_partial_inflight = False
+        self._rtc_phase = RTC_PHASE_DISCONNECTED
+        if was_active:
+            self._push_event(
+                {
+                    "type": "rtc_state",
+                    "phase": RTC_PHASE_DISCONNECTED,
+                    "session": None,
+                    "utterance_id": self._rtc_utterance_id,
+                    "reason": reason,
+                }
+            )
 
     # ------------------------------------------------------------------
     # Status payload
@@ -664,6 +1697,12 @@ class ClipRuntime:
                 "last_error": self._last_error,
                 "input_mode": settings.VOICE_INPUT_MODE,
                 "record_mode": settings.CLIP_RECORD_MODE,
+                "rtc_phase": self._rtc_phase,
+                "rtc_session": self._rtc_session,
+                "rtc_utterance_id": self._rtc_utterance_id,
+                "rtc_partial_transcript": self._rtc_partial_text,
+                "rtc_processing": self._rtc_finalize_pending > 0,
+                "rtc_error": self._rtc_last_error,
             }
         )
         return payload
@@ -683,6 +1722,14 @@ class ClipRuntime:
         """Idempotent enqueue: repeated events / retries never duplicate work."""
         if not session_id:
             return {"accepted": False, "reason": "missing session id"}
+        if self._rtc_active:
+            # RTC owns the single file-frame channel; SD ingestion would steal
+            # stream frames. Never route RTC sessions into the SD pipeline.
+            return {
+                "accepted": False,
+                "session": session_id,
+                "reason": "RTC live stream is armed; SD ingestion disabled",
+            }
         row = store.get_ingestion(self.device_id, session_id)
         if row is None:
             # A stopped session immediately enters the ingestion workflow:
@@ -819,7 +1866,12 @@ class ClipRuntime:
         self._push_event({"type": "workflow", "session": sid, "status": "downloading"})
         try:
             result = await self._download_session(sid)
-        except (ClipUnavailableError, ClipTransferFailedError, OpusFormatError) as exc:
+        except (
+            ClipUnavailableError,
+            ClipCommandFailedError,
+            ClipTransferFailedError,
+            OpusFormatError,
+        ) as exc:
             store.mark_failed(device, sid, str(exc))
             self._push_event(
                 {
@@ -968,6 +2020,10 @@ class ClipRuntime:
         async with self._operation_lock:
             if not self._ready or not self.is_connected:
                 raise ClipUnavailableError("Clip is not connected or is reconnecting")
+            if self._rtc_active:
+                raise ClipConflictError(
+                    "RTC live stream holds the file-frame channel"
+                )
             self._transfer_active = True
             self._transport_lost.clear()
             download_task = asyncio.create_task(
@@ -991,7 +2047,12 @@ class ClipRuntime:
                 return await download_task
             except (TransferError, TransferTimeoutError) as exc:
                 raise ClipTransferFailedError(str(exc)) from exc
-            except (CommandTimeoutError, ClipConnectionError, ProtocolError, CommandError) as exc:
+            except CommandError as exc:
+                # A rejected session command (most importantly "Session not
+                # found" for a stale/live-only RTC id) says nothing about BLE
+                # health.  Do not turn it into a reconnect loop.
+                raise ClipCommandFailedError(str(exc)) from exc
+            except (CommandTimeoutError, ClipConnectionError, ProtocolError) as exc:
                 raise ClipUnavailableError(f"transfer interrupted: {exc}") from exc
             except (ClipUnavailableError, ClipTransferFailedError):
                 raise

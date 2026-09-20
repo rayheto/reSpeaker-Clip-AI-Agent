@@ -9,6 +9,10 @@ class Settings:
     GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL", "qwen/qwen3.6-27b")
     GROQ_AGENT_MODEL: str = os.getenv("GROQ_AGENT_MODEL", "openai/gpt-oss-20b")
     GROQ_STT_MODEL: str = os.getenv("GROQ_STT_MODEL", "whisper-large-v3")
+    # RTC live-stream STT: rolling partials use a fast model; the final
+    # authoritative transcription of each utterance uses the final model.
+    GROQ_RTC_PARTIAL_MODEL: str = os.getenv("GROQ_RTC_PARTIAL_MODEL", "whisper-large-v3-turbo")
+    GROQ_RTC_FINAL_MODEL: str = os.getenv("GROQ_RTC_FINAL_MODEL", "").strip()
     GROQ_TTS_MODEL: str = os.getenv("GROQ_TTS_MODEL", "canopylabs/orpheus-v1-english")
     TTS_VOICE: str = os.getenv("TTS_VOICE", "autumn")
     DATABASE_URL: str = os.getenv("DATABASE_URL", "sqlite:///chat.db")
@@ -31,6 +35,35 @@ class Settings:
     CLIP_DOWNLOAD_TIMEOUT: int = int(os.getenv("CLIP_DOWNLOAD_TIMEOUT", "300"))
     CLIP_TEMP_DIR: str = os.getenv("CLIP_TEMP_DIR", "clip_audio")
     CLIP_MAX_FAILED_ARTIFACTS: int = int(os.getenv("CLIP_MAX_FAILED_ARTIFACTS", "5"))
+
+    # --- reSpeaker Clip RTC live streaming (AT+START=rtc) ---
+    # One RTC session stays armed for the whole process: the firmware mic
+    # pipeline runs warm while it emits nothing over BLE during warm pauses.
+    # Each RESUME->PAUSE interval is one logical utterance; rolling partial
+    # transcripts use cumulative in-memory Ogg snapshots, and the final
+    # transcript goes through AudioService.process_transcript exactly once.
+    RTC_AUTO_ARM: bool = os.getenv("RTC_AUTO_ARM", "true").lower() in ("1", "true", "yes", "on")
+    # Ignore RTC state notifications arriving shortly after arming: the
+    # initial STREAMING/PAUSED pair can lag behind the arm commands in the
+    # BLE notification stream and must not start/finalize an utterance.
+    RTC_SETTLE_SECONDS: float = float(os.getenv("RTC_SETTLE_SECONDS", "1.0"))
+    # Bounded time to wait for the RTC stream (STREAM_START) while arming.
+    RTC_ARM_TIMEOUT: float = float(os.getenv("RTC_ARM_TIMEOUT", "15"))
+    # Rolling partial transcription cadence (seconds between snapshots).
+    RTC_PARTIAL_INTERVAL: float = float(os.getenv("RTC_PARTIAL_INTERVAL", "2.0"))
+    # A snapshot must contain at least this many Opus frames (~20 ms each at
+    # 50 fps) before a partial STT request is worth issuing.
+    RTC_PARTIAL_MIN_FRAMES: int = int(os.getenv("RTC_PARTIAL_MIN_FRAMES", "25"))
+    # Utterances shorter than this many frames never reach the LLM.
+    RTC_MIN_UTTERANCE_FRAMES: int = int(os.getenv("RTC_MIN_UTTERANCE_FRAMES", "25"))
+    # Hard bound on buffered frames per utterance (50 fps * 3600 s ~ 180k).
+    RTC_MAX_UTTERANCE_FRAMES: int = int(os.getenv("RTC_MAX_UTTERANCE_FRAMES", "180000"))
+    # Tentative pre-roll ring: frames arriving right around a RESUME/STREAMING
+    # transition are seeded into the next utterance so the first words are
+    # never lost when event and frame characteristics race.
+    RTC_PRE_ROLL_FRAMES: int = int(os.getenv("RTC_PRE_ROLL_FRAMES", "15"))
+    # Upper bound on finalize jobs waiting for their STT/LLM turn (FIFO).
+    RTC_MAX_PENDING_FINALIZE: int = int(os.getenv("RTC_MAX_PENDING_FINALIZE", "16"))
     TAVILY_API_KEY: str = os.getenv("TAVILY_API_KEY", "")
 
     # Composio: API key + the toolkits exposed to the agent through

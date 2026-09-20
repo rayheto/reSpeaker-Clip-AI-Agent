@@ -139,6 +139,22 @@ def clip_stop():
     return jsonify(result), 202
 
 
+@clip_bp.route("/clip/stream/resume", methods=["POST"])
+def clip_stream_resume():
+    """Resume the armed RTC session (start the next logical utterance)."""
+    worker = _require_worker()
+    result = worker.rtc_resume()
+    return jsonify(result), 200
+
+
+@clip_bp.route("/clip/stream/pause", methods=["POST"])
+def clip_stream_pause():
+    """Warm-pause the RTC session (finalize the current utterance)."""
+    worker = _require_worker()
+    result = worker.rtc_pause()
+    return jsonify(result), 202
+
+
 @clip_bp.route("/clip/sessions/<session_id>/ingest", methods=["POST"])
 def clip_ingest(session_id: str):
     worker = _require_worker()

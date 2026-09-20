@@ -114,7 +114,7 @@ sequenceDiagram
 
 - Python 3.10+
 - **Groq API 密钥**（必需 — 驱动 LLM、STT、TTS）
-- **reSpeaker Clip**（可选但推荐的语音输入）。`requirements.txt` 中固定安装了来自 Seeed 仓库提交 `93f86674a...` 的 `respeaker-clip-sdk[ble]`（含 `bleak`）；BLE 需要 Linux/Windows 主机（Linux 需 bluez）。
+- **reSpeaker Clip**（可选但推荐的语音输入）。`requirements.txt` 中固定安装了来自 **rayheto fork** 的 `reSpeaker_Clip` 提交 `a146061b` 的 `respeaker-clip-sdk[ble]`（含 `bleak`）——上游 Seeed 固定提交 `93f8667` 不包含 RTC 直播流（`clip.stream` / `start_rtc`）；BLE 需要 Linux/Windows 主机（Linux 需 bluez）。
 - 可选 API 密钥（每个功能在缺失时会优雅降级）：
   - **Tavily** — 网页搜索工具
   - **Financial Modeling Prep（FMP）** — 金融工具（行情、公司简介、财报、新闻）
@@ -341,7 +341,7 @@ backend/
 
 **BLE 前置条件（Linux）：** 安装 BlueZ（`sudo apt install bluez bluetooth`），确保适配器已启用（`bluetoothctl power on`），并确认 Clip 可见/可配对。若 Clip 首次开机，必要时长按进入 BLE 配对。
 
-**固定 SDK 版本：** `requirements.txt` 从 `github.com/Seeed-Studio/reSpeaker_Clip` 的提交 `93f86674a280b3325dd37a152d9b80d02857b049`（`subdirectory=sdk`）安装 `respeaker-clip-sdk[ble]`。运行时只使用当前 SDK API（`clip.ClipClient` + `clip.BleTransport`），不使用旧的 `ClipDevice` API。
+**SDK 版本（RTC 直播流）：** `requirements.txt` 从 **rayheto fork**（`github.com/rayheto/reSpeaker_Clip`）的提交 `a146061b3820473f119dfaa7e8ac6791a48b9edb`（`subdirectory=sdk`）安装 `respeaker-clip-sdk[ble]`。该提交是 RTC 直播流合并点：保留稳定的 `clip.ClipClient` / `clip.BleTransport` 行为，并新增 `ClipClient.start_rtc()`、`stream_rtc()`、`StreamReceiver` 以及带租约令牌的 `BaseTransport.detach_file_frame_handler()`。上游 Seeed 固定提交 `93f8667` 早于 RTC 功能，因此被替换；fork 与 `dev` 主线保持一致。
 
 **单进程 / 单工作线程 — 关闭 Flask reloader。** 运行时为每台物理设备维护一条长期 BLE 连接和一个重连监督器。`app.py` 以 `use_reloader=False` 运行；不要用多个 worker/进程同时创建指向同一设备的 Clip 连接。开发时请直接 `python app.py` 启动，而不是使用开启 reloader 的 flask 命令。
 

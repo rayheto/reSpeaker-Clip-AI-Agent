@@ -12,8 +12,10 @@ imports the legacy ``applications/clip`` utilities.
 
 from __future__ import annotations
 
+import io
 import json
 import struct
+from typing import Any
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -177,16 +179,27 @@ class OggOpusWriter:
 
     def __init__(
         self,
-        path: str | Path,
+        path: str | Path | None,
         *,
+        stream: Any | None = None,
         sample_rate: int = 16000,
         channels: int = 1,
         serial: int = 0x12345678,
         vendor: str = "reSpeaker Clip AI Agent",
     ) -> None:
-        self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._file = self.path.open("wb")
+        """Write to ``path`` or, when ``stream`` is given, to a binary stream.
+
+        The stream variant is used for in-memory RTC utterance snapshots
+        (``convert_frames_to_ogg_bytes``) so rolling partials never touch disk.
+        """
+        self.path = Path(path) if path is not None else None
+        self._owns_file = stream is None
+        if stream is not None:
+            self._file = stream
+        else:
+            assert self.path is not None
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._file = self.path.open("wb")
         self.sample_rate = sample_rate
         self.channels = channels
         self.serial = serial
@@ -299,7 +312,8 @@ class OggOpusWriter:
             # Header-only stream: still mark the BOS page EOS.
             raise OpusFormatError("no pages were written")
         self._patch_last_page_eos()
-        self._file.close()
+        if self._owns_file:
+            self._file.close()
 
     def __enter__(self) -> "OggOpusWriter":
         return self
@@ -307,7 +321,7 @@ class OggOpusWriter:
     def __exit__(self, exc_type: object, *_exc: object) -> None:
         if exc_type is None:
             self.close()
-        else:
+        elif self._owns_file:
             self._file.close()
 
 
@@ -331,6 +345,35 @@ def convert_opus_to_ogg(
         if frame_count == 0:
             raise OpusFormatError(f"no Opus frames in {input_path}")
     return out
+
+
+def convert_frames_to_ogg_bytes(
+    frames: list[bytes] | tuple[bytes, ...],
+    *,
+    sample_rate: int = 16000,
+    channels: int = 1,
+) -> bytes:
+    """Re-container an in-memory list of raw Opus packets into Ogg Opus bytes.
+
+    Used for bounded RTC utterance snapshots (partial + final STT). Raises
+    :class:`OpusFormatError` when no usable frame is present.
+    """
+    if not frames:
+        raise OpusFormatError("no Opus frames for RTC snapshot")
+    buffer = io.BytesIO()
+    frame_count = 0
+    with OggOpusWriter(
+        None, stream=buffer, sample_rate=sample_rate, channels=channels
+    ) as writer:
+        writer.write_header()
+        for frame in frames:
+            if not frame:
+                continue
+            writer.write_packet(frame)
+            frame_count += 1
+        if frame_count == 0:
+            raise OpusFormatError("no Opus frames for RTC snapshot")
+    return buffer.getvalue()
 
 
 def convert_session_to_ogg(session_dir: str | Path) -> Path:

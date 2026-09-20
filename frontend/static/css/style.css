@@ -90,6 +90,11 @@ h1 {
     align-self: flex-end;
 }
 
+.message.user.provisional {
+    opacity: 0.72;
+    font-style: italic;
+}
+
 .message.assistant {
     background: #533483;
     color: #eee;

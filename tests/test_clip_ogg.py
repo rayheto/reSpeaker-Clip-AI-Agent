@@ -214,3 +214,37 @@ class TestConversions:
         result = convert_opus_to_ogg(src, out, sample_rate=16000, channels=1)
         assert result == out
         assert out.read_bytes().count(b"OggS") == 2 + 3
+
+# ---------------------------------------------------------------------------
+# In-memory RTC utterance snapshots
+# ---------------------------------------------------------------------------
+
+
+def test_convert_frames_to_ogg_bytes_builds_valid_ogg():
+    from backend.clip.ogg import (
+        OggOpusWriter,
+        OpusFormatError,
+        convert_frames_to_ogg_bytes,
+    )
+
+    frames = [b"\xf8\x01\x02\x03\x04"] * 4
+    data = convert_frames_to_ogg_bytes(frames, sample_rate=16000, channels=1)
+    assert data.startswith(b"OggS")
+    assert data.count(b"OggS") >= 3  # BOS + tags + audio pages
+    assert b"OpusHead" in data
+    # The last page carries the EOS flag (header byte 5 bit 0x04).
+    last_page = data.rfind(b"OggS")
+    assert data[last_page + 5] & 0x04
+
+    # Header-only metadata is stable across page serials (deterministic).
+    again = convert_frames_to_ogg_bytes(frames, sample_rate=16000, channels=1)
+    assert again == data
+
+
+def test_convert_frames_to_ogg_bytes_rejects_empty():
+    from backend.clip.ogg import OpusFormatError, convert_frames_to_ogg_bytes
+
+    with pytest.raises(OpusFormatError):
+        convert_frames_to_ogg_bytes([])
+    with pytest.raises(OpusFormatError):
+        convert_frames_to_ogg_bytes([b""])

@@ -1,6 +1,7 @@
 """ClipRuntime lifecycle tests using a fake transport (deterministic, no BLE)."""
 
 import asyncio
+import struct
 import threading
 from types import SimpleNamespace
 
@@ -32,8 +33,30 @@ def run(coro):
     return asyncio.run(coro)
 
 
+def stream_start_frame(sid: str) -> bytes:
+    """Encode a STREAM_START frame (type 0x13) for an RTC session."""
+    return bytes([0x13, len(sid)]) + sid.encode("ascii")
+
+
+def stream_data_frame(sequence: int, payload: bytes) -> bytes:
+    """Encode a STREAM_DATA frame (type 0x14)."""
+    return struct.pack("<BHH", 0x14, sequence & 0xFFFF, len(payload)) + payload
+
+
+def stream_end_frame(reason: int = 0) -> bytes:
+    """Encode a STREAM_END frame (type 0x15)."""
+    return bytes([0x15, reason])
+
+
 class FakeTransport(BaseTransport):
-    """In-memory BaseTransport mimicking the Clip BLE/AT protocol."""
+    """In-memory BaseTransport mimicking the Clip BLE/AT protocol.
+
+    ``rtc_mode`` models the RTC live-stream path: ``AT+START=rtc`` arms a
+    session, ``AT+DOWNLOAD=<sid>`` emits STREAM_START, ``AT+PAUSE`` /
+    ``AT+RESUME`` move between PAUSED and STREAMING with state notifications,
+    and ``AT+STOP`` ends the stream (IDLE + STREAM_END). Legacy SD recording
+    keeps the original behavior.
+    """
 
     def __init__(self):
         super().__init__()
@@ -50,6 +73,29 @@ class FakeTransport(BaseTransport):
         self._session_counter = 0
         self.max_concurrent = 0
         self._concurrent = 0
+        # RTC live-stream model
+        self.rtc_mode = False
+        self.rtc_session: str | None = None
+        self.last_rtc_session: str | None = None
+        self._rtc_counter = 0
+        self.rtc_seq = 0
+        self.rtc_stream_start_count = 1
+        self.rtc_start_session_omitted = False
+        self.retain_rtc_session_on_stop = False
+        self.missing_session_error = False
+        self.rtc_idle_on_download = False
+        self.rtc_stale_download_responses = 0
+
+    def _next_rtc_session(self) -> str:
+        self._rtc_counter += 1
+        return f"2026990{self._rtc_counter:07d}"
+
+    def emit_stream_data(self, payload: bytes, sequence: int | None = None) -> int:
+        """Deliver one STREAM_DATA frame through the file-frame handler."""
+        seq = self.rtc_seq if sequence is None else sequence
+        self.rtc_seq = seq + 1
+        self._emit_file_frame(stream_data_frame(seq, payload))
+        return seq
 
     @property
     def is_connected(self) -> bool:
@@ -118,19 +164,47 @@ class FakeTransport(BaseTransport):
                         "device": "Clip",
                     },
                 }
+            if command == "AT+START=rtc":
+                sid = self._next_rtc_session()
+                self.rtc_mode = True
+                self.rtc_session = sid
+                self.last_rtc_session = sid
+                self.status_state = "STREAMING"
+                self.status_session = sid
+                self.emit_state("STREAMING", sid)
+                await asyncio.sleep(0)  # let the notification task run
+                return {
+                    "ok": True,
+                    "data": {} if self.rtc_start_session_omitted else {"session": sid},
+                }
             if command.startswith("AT+START"):
                 sid = self._next_session()
                 self.status_state = "RECORDING"
                 self.status_recording = True
                 self.status_session = sid
                 self.emit_state("RECORDING", sid)
+                await asyncio.sleep(0)
                 return {"ok": True, "data": {"session": sid}}
             if command == "AT+STOP":
+                if self.rtc_mode:
+                    sid = self.rtc_session
+                    self.rtc_mode = False
+                    self.rtc_session = None
+                    self.status_state = "IDLE"
+                    self.status_recording = False
+                    self.status_session = (
+                        sid if self.retain_rtc_session_on_stop else None
+                    )
+                    self.emit_state("IDLE", sid, duration=0)
+                    self._emit_file_frame(stream_end_frame(0))
+                    await asyncio.sleep(0)
+                    return {"ok": True, "data": {"session": sid, "duration": 0}}
                 sid = self.status_session
                 self.status_state = "IDLE"
                 self.status_recording = False
                 self.status_session = None
                 self.emit_state("IDLE", sid, duration=12)
+                await asyncio.sleep(0)
                 return {"ok": True, "data": {"session": sid, "duration": 12}}
             if command == "AT+DEVICE?":
                 # AT+DEVICE? returns the name at the top level (not in data).
@@ -153,6 +227,63 @@ class FakeTransport(BaseTransport):
                         "total": len(self.session_items),
                     },
                 }
+            if command.startswith("AT+LIST=") and self.missing_session_error:
+                raise CommandError(
+                    "Session not found",
+                    command=command,
+                    response={"ok": False, "msg": "Session not found"},
+                )
+            if command.startswith("AT+DOWNLOAD=") and self.rtc_mode:
+                target = command.split("=", 1)[1].split(":", 1)[0]
+                if target == self.rtc_session:
+                    if self.rtc_stale_download_responses > 0:
+                        self.rtc_stale_download_responses -= 1
+                        # A delayed duplicate START response consumed while
+                        # the current Write Without Response was lost.
+                        return {
+                            "ok": True,
+                            "data": {"session": target, "mode": "rtc"},
+                        }
+                    if self.rtc_idle_on_download:
+                        self.rtc_mode = False
+                        self.status_state = "IDLE"
+                        self.status_recording = False
+                        self._emit_event({"event": "rtc", "status": "timeout"})
+                        self.emit_state("IDLE", target, duration=5)
+                        await asyncio.sleep(0)
+                        return {
+                            "ok": True,
+                            "data": {"state": "streaming", "session": target},
+                        }
+                    for _ in range(self.rtc_stream_start_count):
+                        self._emit_file_frame(stream_start_frame(target))
+                    await asyncio.sleep(0)
+                    return {
+                        "ok": True,
+                        "data": {"state": "streaming", "session": target},
+                    }
+            if command == "AT+PAUSE":
+                if self.rtc_mode and self.status_state == "STREAMING":
+                    self.status_state = "PAUSED"
+                    self.emit_state("PAUSED", self.rtc_session)
+                    await asyncio.sleep(0)
+                    return {"ok": True, "data": {}}
+                raise CommandError(
+                    "not recording",
+                    command=command,
+                    response={"ok": False, "msg": "not recording"},
+                )
+            if command == "AT+RESUME":
+                if self.rtc_mode and self.status_state == "PAUSED":
+                    self.status_state = "STREAMING"
+                    self.emit_state("STREAMING", self.rtc_session)
+                    await asyncio.sleep(0)
+                    return {"ok": True, "data": {}}
+                raise CommandError(
+                    "not paused",
+                    command=command,
+                    response={"ok": False, "msg": "not paused"},
+                )
             return {"ok": True, "data": {}}
         finally:
             self._concurrent -= 1
@@ -167,8 +298,17 @@ def clip_db(monkeypatch, tmp_path):
     store.init_clip_ingestions()
 
 
-def make_runtime(transport: FakeTransport | None = None, device_id: str = "Clip") -> ClipRuntime:
-    return ClipRuntime(transport=transport or FakeTransport(), device_id=device_id)
+def make_runtime(
+    transport: FakeTransport | None = None,
+    device_id: str = "Clip",
+    rtc_auto_arm: bool = False,
+) -> ClipRuntime:
+    """Build a runtime; RTC auto-arm is opt-in so legacy tests are untouched."""
+    return ClipRuntime(
+        transport=transport or FakeTransport(),
+        device_id=device_id,
+        rtc_auto_arm=rtc_auto_arm,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -402,6 +542,24 @@ class TestSupervisor:
             assert result is expected
             assert attempts == 2
             assert runtime._transfer_active is False
+
+        run(body())
+
+    def test_session_not_found_is_terminal_without_ble_reconnect(self):
+        async def body():
+            transport = FakeTransport()
+            transport.missing_session_error = True
+            runtime = make_runtime(transport)
+            await runtime._connect()
+            runtime._ready = True
+            runtime._connection_ready.set()
+
+            with pytest.raises(ClipCommandFailedError, match="Session not found"):
+                await runtime._download_session("00000000000388")
+
+            assert runtime.is_connected is True
+            assert transport.connect_calls == 1
+            assert transport.commands.count("AT+LIST=00000000000388") == 1
 
         run(body())
 

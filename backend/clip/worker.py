@@ -136,6 +136,14 @@ class ClipWorker:
         runtime = self._require_runtime()
         return self.call(runtime.stop_recording())
 
+    def rtc_resume(self) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        return self.call(runtime.rtc_resume())
+
+    def rtc_pause(self) -> dict[str, Any]:
+        runtime = self._require_runtime()
+        return self.call(runtime.rtc_pause())
+
     def ingest(self, session_id: str, trigger: str = "manual") -> dict[str, Any]:
         runtime = self._require_runtime()
         return self.call(runtime.manual_ingest(session_id, trigger=trigger))
